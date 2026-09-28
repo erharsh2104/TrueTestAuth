@@ -94,7 +94,7 @@ def seed_users(dm: DataManager) -> None:
 
 
 def train_initial_model(dm: DataManager, model_path: str) -> None:
-    """Train the RF + SVM ensemble across every enrolled student."""
+    """Train the LSTM model across every enrolled student."""
     X: List[List[float]] = []
     y: List[str] = []
     for username, *_ in STUDENTS:

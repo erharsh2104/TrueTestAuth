@@ -1,20 +1,24 @@
-"""BehavioralAuthModel — RF + SVM ensemble over 13 keystroke-dynamics features.
+"""BehavioralAuthModel — LSTM over 13 keystroke-dynamics features.
 
-Kept API-compatible with the original behavioral_auth mini-project so that
-existing pickles under models/behavioral_auth_model.pkl keep loading.
+Uses an LSTM network to model the sequential nature of keystroke timing
+patterns for user authentication.  API-compatible with the original
+RF+SVM ensemble so the rest of the application keeps working unchanged.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import statistics
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-import joblib
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
+
+# Suppress TF info/warnings before import
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+import tensorflow as tf  # noqa: E402
+from tensorflow import keras  # noqa: E402
+from tensorflow.keras import layers  # noqa: E402
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -34,8 +38,6 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "n_keys",
 )
 
-RF_WEIGHT = 0.60
-SVM_WEIGHT = 0.40
 AUTH_THRESHOLD = 0.45
 
 
@@ -96,88 +98,159 @@ def extract_features(keystrokes: Sequence[Dict]) -> List[float]:
 
 # ── Model wrapper ────────────────────────────────────────────────────────────
 class BehavioralAuthModel:
-    """Random-Forest + SVM soft-voting ensemble over 13 keystroke features."""
+    """LSTM-based classifier over 13 keystroke-dynamics features.
+
+    Each 13-dim feature vector is reshaped into a sequence of 13 timesteps
+    with 1 feature each, letting the LSTM capture the ordering/dependency
+    across the feature dimensions (dwell → flight → speed → rhythm …).
+    """
+
+    N_FEATURES = 13
+    # LSTM architecture hyper-parameters
+    LSTM_UNITS = 64
+    DENSE_UNITS = 32
+    DROPOUT = 0.3
+    EPOCHS = 80
+    BATCH_SIZE = 16
 
     def __init__(self) -> None:
-        """Create empty RF/SVM pair — call fit() before predicting."""
-        self.scaler = StandardScaler()
-        self.rf = RandomForestClassifier(
-            n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
-        )
-        self.svm = SVC(kernel="rbf", probability=True, C=1.0, gamma="scale", random_state=42)
+        """Create an empty model shell — call fit() before predicting."""
+        self.model: Optional[keras.Model] = None
         self.classes_: List[str] = []
         self.is_trained: bool = False
+        # Per-feature mean/std for manual scaling (avoid sklearn dependency)
+        self._mean: Optional[np.ndarray] = None
+        self._std: Optional[np.ndarray] = None
+
+    # -------- internal helpers --------
+    def _build_model(self, n_classes: int) -> keras.Model:
+        """Construct and compile the Keras LSTM model."""
+        model = keras.Sequential([
+            layers.Input(shape=(self.N_FEATURES, 1)),
+            layers.LSTM(self.LSTM_UNITS, return_sequences=True),
+            layers.Dropout(self.DROPOUT),
+            layers.LSTM(self.LSTM_UNITS // 2),
+            layers.Dropout(self.DROPOUT),
+            layers.Dense(self.DENSE_UNITS, activation="relu"),
+            layers.Dropout(self.DROPOUT / 2),
+            layers.Dense(n_classes, activation="softmax"),
+        ])
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+        return model
+
+    def _scale(self, X: np.ndarray) -> np.ndarray:
+        """Apply stored z-score normalisation."""
+        return (X - self._mean) / (self._std + 1e-8)
+
+    def _fit_scaler(self, X: np.ndarray) -> np.ndarray:
+        """Compute mean/std from training data and return scaled version."""
+        self._mean = X.mean(axis=0)
+        self._std = X.std(axis=0)
+        return self._scale(X)
 
     # ----------- training -----------
     def fit(self, X: List[List[float]], y: List[str]) -> Dict[str, float]:
-        """Train both learners; returns basic train-accuracy metrics."""
+        """Train the LSTM; returns basic train-accuracy metrics."""
         if len(set(y)) < 2:
-            raise ValueError("Need at least two distinct users to train the ensemble.")
+            raise ValueError("Need at least two distinct users to train the model.")
 
-        X_arr = np.asarray(X, dtype=float)
-        y_arr = np.asarray(y)
-        self.classes_ = sorted(set(y_arr.tolist()))
+        X_arr = np.asarray(X, dtype=np.float32)
+        self.classes_ = sorted(set(y))
+        label_map = {c: i for i, c in enumerate(self.classes_)}
+        y_int = np.array([label_map[label] for label in y], dtype=np.int32)
 
-        X_scaled = self.scaler.fit_transform(X_arr)
-        self.rf.fit(X_scaled, y_arr)
-        self.svm.fit(X_scaled, y_arr)
+        # Scale features and reshape → (samples, timesteps=13, features=1)
+        X_scaled = self._fit_scaler(X_arr)
+        X_seq = X_scaled.reshape(-1, self.N_FEATURES, 1)
+
+        self.model = self._build_model(len(self.classes_))
+        history = self.model.fit(
+            X_seq, y_int,
+            epochs=self.EPOCHS,
+            batch_size=self.BATCH_SIZE,
+            validation_split=0.15 if len(y_int) >= 10 else 0.0,
+            verbose=0,
+        )
         self.is_trained = True
 
-        rf_acc = float(self.rf.score(X_scaled, y_arr))
-        svm_acc = float(self.svm.score(X_scaled, y_arr))
-        return {"rf_acc": rf_acc, "svm_acc": svm_acc, "n_users": len(self.classes_)}
+        # Gather metrics
+        final_acc = float(history.history["accuracy"][-1])
+        val_acc = (
+            float(history.history["val_accuracy"][-1])
+            if "val_accuracy" in history.history
+            else final_acc
+        )
+        return {
+            "lstm_train_acc": final_acc,
+            "lstm_val_acc": val_acc,
+            "n_users": len(self.classes_),
+        }
 
     # ----------- prediction -----------
     def predict(self, features: List[float], username: str) -> Dict[str, float]:
-        """Return {confidence, decision, rf_prob, svm_prob} for `username`."""
+        """Return {confidence, decision, lstm_prob} for `username`."""
         if not self.is_trained or username not in self.classes_:
             return {
                 "confidence": 0.0,
                 "decision": False,
-                "rf_prob": 0.0,
-                "svm_prob": 0.0,
+                "lstm_prob": 0.0,
             }
 
-        X_scaled = self.scaler.transform(np.asarray([features], dtype=float))
-        idx = self.rf.classes_.tolist().index(username)
+        X_arr = np.asarray([features], dtype=np.float32)
+        X_scaled = self._scale(X_arr)
+        X_seq = X_scaled.reshape(-1, self.N_FEATURES, 1)
 
-        rf_prob = float(self.rf.predict_proba(X_scaled)[0][idx])
-        svm_idx = self.svm.classes_.tolist().index(username)
-        svm_prob = float(self.svm.predict_proba(X_scaled)[0][svm_idx])
+        probs = self.model.predict(X_seq, verbose=0)[0]
+        idx = self.classes_.index(username)
+        lstm_prob = float(probs[idx])
 
-        confidence = RF_WEIGHT * rf_prob + SVM_WEIGHT * svm_prob
         return {
-            "confidence": float(confidence),
-            "decision": bool(confidence >= AUTH_THRESHOLD),
-            "rf_prob": rf_prob,
-            "svm_prob": svm_prob,
+            "confidence": lstm_prob,
+            "decision": bool(lstm_prob >= AUTH_THRESHOLD),
+            "lstm_prob": lstm_prob,
         }
 
     # ----------- persistence -----------
     def save(self, path: str) -> None:
-        """Serialise the whole model object (scaler + rf + svm) to `path`."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        joblib.dump(
-            {
-                "scaler": self.scaler,
-                "rf": self.rf,
-                "svm": self.svm,
-                "classes_": self.classes_,
-                "is_trained": self.is_trained,
-            },
-            path,
-        )
+        """Save the LSTM model weights + metadata to `path` directory."""
+        # Use the pkl path as a base; create a sibling directory for LSTM
+        save_dir = path.replace(".pkl", "_lstm")
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save the Keras model
+        self.model.save(os.path.join(save_dir, "lstm_model.keras"))
+
+        # Save metadata (classes, scaler params)
+        meta = {
+            "classes_": self.classes_,
+            "is_trained": self.is_trained,
+            "mean": self._mean.tolist() if self._mean is not None else None,
+            "std": self._std.tolist() if self._std is not None else None,
+        }
+        with open(os.path.join(save_dir, "metadata.json"), "w") as f:
+            json.dump(meta, f)
 
     @classmethod
     def load(cls, path: str) -> "BehavioralAuthModel":
-        """Load a previously-saved ensemble from `path`; returns a ready model."""
+        """Load a previously-saved LSTM model; returns a ready model."""
         obj = cls()
-        if not os.path.exists(path):
-            return obj
-        data = joblib.load(path)
-        obj.scaler = data["scaler"]
-        obj.rf = data["rf"]
-        obj.svm = data["svm"]
-        obj.classes_ = data["classes_"]
-        obj.is_trained = data["is_trained"]
+        load_dir = path.replace(".pkl", "_lstm")
+        meta_path = os.path.join(load_dir, "metadata.json")
+        model_path = os.path.join(load_dir, "lstm_model.keras")
+
+        if not os.path.exists(meta_path) or not os.path.exists(model_path):
+            return obj  # return empty/untrained shell
+
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        obj.classes_ = meta["classes_"]
+        obj.is_trained = meta["is_trained"]
+        obj._mean = np.array(meta["mean"], dtype=np.float32) if meta["mean"] is not None else None
+        obj._std = np.array(meta["std"], dtype=np.float32) if meta["std"] is not None else None
+        obj.model = keras.models.load_model(model_path)
         return obj

@@ -930,7 +930,7 @@ def load_model() -> BehavioralAuthModel:
 
 
 def retrain_model() -> Optional[Dict[str, float]]:
-    """Retrain the RF+SVM ensemble across every enrolled student."""
+    """Retrain the LSTM model across every enrolled student."""
     dm = get_data_manager()
     enrolled = dm.all_enrolled_users()
     if len(enrolled) < 2:
@@ -1271,7 +1271,7 @@ def show_login_page() -> None:
             '</div></div>'
             '<div class="stat-strip">'
             '<div class="stat"><b>13</b><span>Behavioral features</span></div>'
-            '<div class="stat"><b>RF+SVM</b><span>Ensemble model</span></div>'
+            '<div class="stat"><b>LSTM</b><span>Sequence model</span></div>'
             '<div class="stat"><b>&lt;1s</b><span>Verification time</span></div>'
             '</div></div>',
             unsafe_allow_html=True,

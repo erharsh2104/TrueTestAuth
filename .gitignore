@@ -7,4 +7,6 @@ venv/
 .streamlit/secrets.toml
 data/*.json
 models/*.pkl
+models/*_lstm/
+models/*.keras
 .qodo/

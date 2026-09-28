@@ -85,10 +85,9 @@ The project is built with:
 
 - Python
 - Streamlit
-- scikit-learn
+- TensorFlow / Keras
 - NumPy
 - Pandas
-- Joblib
 - Requests
 - python-dotenv
 - pdfplumber
