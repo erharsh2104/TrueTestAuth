@@ -1,4 +1,3 @@
-```markdown
 # TrueTestAuth
 
 TrueTestAuth is a Streamlit-based assessment platform that combines **behavioral keystroke authentication**, **continuous identity verification**, **proctored exams**, and an **auto-graded C++ coding-lab environment** for faculty and students.
@@ -9,31 +8,31 @@ The application provides separate faculty and student workflows, stores applicat
 
 ## Project Overview
 
-TrueTestAuth is designed around a simple assessment workflow:
+TrueTestAuth is designed around an online-assessment workflow in which faculty create assessments and students complete them under behavioral verification.
 
-- Faculty create exams and coding labs.
-- Students access assessments through their enrolled courses.
-- Student identity is verified using typing behavior.
-- Exams continuously monitor keystroke dynamics during the session.
-- Copy/paste-related actions are blocked and logged in supported assessment fields.
-- C++ lab submissions are compiled, executed, tested, scored, and stored.
-- Faculty can review submissions, behavioral-authentication timelines, integrity information, and academic history.
+The current implementation includes:
 
-The current repository is implemented as a **single Streamlit application with supporting Python modules, a custom frontend component, local JSON persistence, and a bundled LSTM model**.
+- Faculty and student accounts with role-based workflows
+- Behavioral keystroke enrollment and authentication
+- Continuous behavioral verification during exams and coding labs
+- Copy/paste and related browser interaction restrictions in assessment editors
+- Timed exams with MCQ auto-grading and descriptive-answer storage
+- C++ coding labs with visible and hidden test cases
+- Automatic coding-test evaluation and submission history
+- Faculty dashboards and behavioral/integrity reports
+- PDF question-paper text extraction using `pdfplumber`
+- Local JSON persistence
+- TensorFlow/Keras LSTM model persistence
 
 ---
 
 ## Problem Statement
 
-Password-based login only verifies possession of credentials at one point in time. For online assessments, the application also needs a way to monitor whether the student's interaction remains consistent throughout an assessment.
+Password authentication verifies credentials at login, but it does not continuously verify the identity of the person completing an online assessment.
 
-TrueTestAuth addresses this by using:
+TrueTestAuth extends the assessment workflow with keystroke-dynamics-based verification. Typing events are converted into numerical features and evaluated by an LSTM classifier. The platform also logs supported clipboard events and periodically rechecks behavioral confidence during assessments.
 
-1. Password-based account authentication.
-2. Keystroke-dynamics-based behavioral verification.
-3. Periodic behavioral checks during exams and coding labs.
-4. Clipboard-event logging and client-side clipboard restrictions.
-5. Integrated C++ compilation and hidden-test grading.
+For programming labs, the platform additionally provides C++ compilation, execution, hidden-test grading, and submission tracking.
 
 ---
 
@@ -43,28 +42,12 @@ TrueTestAuth addresses this by using:
 
 The application supports two roles:
 
-- **Faculty**
-  - Dashboard overview
-  - Exam creation and management
-  - Coding-lab creation and management
-  - Exam and lab submission review
-  - Behavioral-authentication reports
-  - Course settings and enrolled-student view
-
-- **Student**
-  - Course dashboard
-  - Course-specific exams and labs
-  - Behavioral login verification
-  - Exam identity-verification gate
-  - Timed exam portal
-  - Continuous behavioral authentication
-  - C++ coding workspace
-  - Submission history
-  - Exam submission and integrity summary
+- **Faculty** — manage exams, coding labs, enrolled students, submissions, reports, and course settings.
+- **Student** — access enrolled courses, complete behavioral verification, attempt exams, solve coding problems, and review submission history.
 
 ### Behavioral Authentication
 
-The application extracts a 13-dimensional keystroke feature vector:
+The application extracts a 13-dimensional feature vector from typing events:
 
 1. `mean_dwell`
 2. `std_dwell`
@@ -80,130 +63,83 @@ The application extracts a 13-dimensional keystroke feature vector:
 12. `total_time_ms`
 13. `n_keys`
 
-These features are used by the TensorFlow/Keras behavioral-authentication model.
+The resulting vector is normalized and passed to the LSTM model for user-specific probability estimation.
 
 ### Continuous Verification
 
-During exams and coding labs, the frontend collects recent keystroke events and sends feature vectors for periodic authentication checks.
+During exams and labs, recent keystroke events can be checked periodically.
 
-The implemented thresholds are:
+The implemented confidence interpretation is:
 
 | Confidence | Status |
-|---|---|
+| --- | --- |
 | `>= 0.65` | Verified |
 | `0.45 - < 0.65` | Warning |
 | `< 0.45` | Flagged |
 
-Exam sessions also maintain a consecutive-failure counter.
+The model's main authentication acceptance threshold is `0.45`.
 
 ### Copy/Paste Protection
 
-In the custom frontend:
+The browser-side assessment interface disables or intercepts:
 
-- Paste is prevented.
-- Copy is prevented.
-- Cut is prevented.
-- Context-menu usage is prevented.
-- Drag-and-drop is prevented.
-- Paste attempts are logged with the affected question/problem and character count.
+- Paste
+- Copy
+- Cut
+- Context-menu actions
+- Drag-and-drop
 
-These restrictions are attached to exam answer textareas and the coding-lab code/stdin editors.
+Supported paste attempts are also sent to the Streamlit application for logging.
 
 ### Proctored Exams
 
-Faculty can create exams with:
+Faculty can create exams containing descriptive questions and MCQs. Exam configuration includes title, course/subject, date, start time, duration, instructions, questions, options, correct answers, and marks.
 
-- Exam title
-- Subject/course
-- Instructions
-- Date
-- Start time
-- Duration
-- Descriptive questions
-- MCQs with four options
-- Marks per question
+Student exam sessions include a timer, question navigation, answer persistence, continuous behavioral verification, manual submission, and timer-based automatic submission.
 
-Student exams provide:
+### C++ Coding Labs
 
-- Countdown timer
-- Question navigator
-- Answer persistence during reruns
-- Continuous authentication
-- Recent authentication readings
-- Manual submission
-- Automatic submission when the timer expires
+Faculty can create coding labs containing multiple C++ problems with:
 
-MCQs are automatically graded. Descriptive questions are stored for review.
-
-### Coding Labs
-
-Faculty can create multi-problem C++ labs with:
-
-- Problem title
 - Difficulty
-- Markdown-compatible statement
+- Problem statement
 - Time limit
 - Memory limit
-- Visible sample input/output
+- Sample tests
 - Hidden test cases
-- Points per hidden test
+- Per-test points
 - Starter code
 
-Students receive a browser-based C++ editor with:
+Students receive a browser-based coding interface with run, submit, reset, custom input, output/error display, and behavioral monitoring.
 
-- C++17 indicator
-- Line numbers
-- Run button
-- Submit button
-- Reset button
-- Custom stdin
-- Compilation/test results
-- Previous-attempt history
-- Continuous behavioral authentication
+### PDF Question-Paper Extraction
 
-### PDF Question-Paper Text Extraction
+Faculty can upload a PDF question paper. `pdfplumber` is used in `app.py` to extract plain text from the uploaded document.
 
-Faculty can upload a PDF question paper. `pdfplumber` is used to extract plain text from the PDF, which can then be reviewed in the UI and used as the initial text for the first exam question.
+### Faculty Reporting
 
-### Faculty Reports
-
-The reports section provides:
-
-- Average authentication confidence
-- Minimum confidence
-- Total authentication checks
-- Flag count
-- Authentication timeline chart
-- Per-exam summary
-- Academic history
-- CSV report download
+The reporting workflow displays behavioral-authentication and academic information, including confidence statistics, flag counts, authentication timelines, exam summaries, and CSV export functionality.
 
 ---
 
-## Technology Stack
+## Tech Stack
 
-### Backend / Application
+### Application
 
 - Python
 - Streamlit
 - Pandas
 - NumPy
-- TensorFlow / Keras
 - Requests
 - python-dotenv
 - pdfplumber
 
 ### Machine Learning
 
-- TensorFlow / Keras
+- TensorFlow CPU
+- Keras
 - LSTM neural network
-- Manual z-score feature normalization
-
-### Code Execution
-
-- Local `g++` / `clang++`
-- Piston API
-- Judge0 API
+- Manual z-score normalization
 
 ### Frontend
 
@@ -212,60 +148,90 @@ The reports section provides:
 - JavaScript
 - Streamlit custom component protocol
 
+### C++ Execution
+
+- Local `g++` / `clang++`
+- Piston API
+- Judge0 API
+
 ### Persistence
 
-- JSON files under `data/`
+- Local JSON files
 
 ---
 
 ## System Architecture
 
-TrueTestAuth follows this architecture:
-
-~~~mermaid
+```mermaid
 flowchart TD
-    U[User Browser] --> S[Streamlit Application<br/>app.py]
+    B[User Browser]
+    A[Streamlit Application<br/>app.py]
+    F[frontend/index.html]
+    M[BehavioralAuthModel<br/>ml_model.py]
+    D[DataManager<br/>data_manager.py]
+    C[CppCompiler<br/>compiler.py]
+    J[Local g++ / clang++]
+    P[Piston API]
+    J0[Judge0 API]
+    MD[models/behavioral_auth_model_lstm]
+    DB[data/*.json]
+    L[Authentication / Integrity Logs]
 
-    S --> AUTH[Authentication & Session Management]
-    S --> DM[DataManager<br/>data_manager.py]
-    S --> ML[BehavioralAuthModel<br/>ml_model.py]
-    S --> CC[CppCompiler<br/>compiler.py]
-    S --> UI[Custom Streamlit UI]
+    B --> A
+    A --> F
+    F -->|keystroke and clipboard events| A
+    A --> M
+    M --> MD
+    M -->|confidence / decision| A
+    A --> D
+    D --> DB
+    A --> C
+    C --> J
+    C --> P
+    C --> J0
+    C -->|run / grade results| A
+    A --> L
+```
 
-    UI --> FE[frontend/index.html]
-    FE --> KS[Keystroke Capture]
-    FE --> CP[Clipboard / Interaction Controls]
+---
 
-    KS --> FEVENTS[Behavioral Feature Payloads]
-    FEVENTS --> S
+## Application Architecture
 
-    AUTH --> USERS[(data/users.json)]
-    DM --> DATA[(Local JSON Storage)]
+The repository is divided into the following main modules.
 
-    ML --> MODEL[(models/behavioral_auth_model_lstm/)]
-    ML --> SCORE[Behavioral Confidence]
+### `app.py`
 
-    CC --> LOCAL[g++ / clang++]
-    CC --> PISTON[Piston API]
-    CC --> JUDGE0[Judge0 API]
+Main Streamlit entry point and application workflow controller. It handles authentication pages, faculty pages, student pages, assessment sessions, frontend events, grading flows, and reports.
 
-    LOCAL --> RESULT[Compile / Run Result]
-    PISTON --> RESULT
-    JUDGE0 --> RESULT
+### `data_manager.py`
 
-    RESULT --> LABS[data/lab_submissions.json]
-    SCORE --> LOGS[data/auth_logs.json]
-    CP --> CPLOG[data/cp_logs.json]
+JSON-backed persistence layer for users, enrollments, exams, labs, submissions, authentication logs, and copy/paste logs.
 
-    FAC[Faculty Workflow] --> S
-    STU[Student Workflow] --> S
-~~~
+### `ml_model.py`
+
+Contains keystroke feature extraction and the `BehavioralAuthModel` LSTM classifier, including training, prediction, scaling, and model/metadata persistence.
+
+### `compiler.py`
+
+Contains the `CppCompiler` abstraction, local C++ execution, Piston integration, Judge0 integration, result normalization, and hidden-test grading.
+
+### `seed_demo.py`
+
+Creates demo users, synthetic behavioral samples, course enrollments, a demo exam, a demo lab, and the initial LSTM model.
+
+### `ui_components.py`
+
+Provides reusable UI layouts, navigation, cards, metrics, status badges, and assessment layout helpers.
+
+### `frontend/index.html`
+
+Implements the custom browser component for keystroke capture, behavioral-feature generation, exam/coding interfaces, periodic authentication events, and clipboard restrictions.
 
 ---
 
 ## Project Structure
 
-~~~text
+```text
 TrueTestAuth/
 ├── .devcontainer/
 │   └── devcontainer.json
@@ -278,154 +244,95 @@ TrueTestAuth/
 │       ├── lstm_model.keras
 │       └── metadata.json
 ├── data/
-│   ├── users.json
+│   ├── enrollments.json
 │   ├── exams.json
 │   ├── labs.json
-│   └── enrollments.json
+│   └── users.json
+├── .env.example
+├── .gitignore
 ├── app.py
 ├── compiler.py
 ├── data_manager.py
 ├── ml_model.py
+├── packages.txt
+├── requirements.txt
 ├── seed_demo.py
 ├── ui_components.py
-├── requirements.txt
-├── packages.txt
-├── .env.example
-├── .gitignore
 └── README.md
-~~~
+```
 
-The application can also create the following JSON files at runtime:
+Runtime activity can additionally create JSON files such as:
 
-~~~text
+```text
 data/
 ├── submissions.json
 ├── lab_submissions.json
 ├── auth_logs.json
 └── cp_logs.json
-~~~
+```
+
+These files are ignored by `.gitignore` through the `data/*.json` rule.
 
 ---
 
-## How the Project Works
+## End-to-End Workflow
 
-### 1. Faculty Registration / Login
-
-Faculty can create an account with:
-
-- Full name
-- Username
-- Password
-- Course name
-
-Faculty login authenticates using username, password, and role.
-
-After login, the faculty member is routed to the overview dashboard.
+```text
+Faculty / Student
+        |
+        v
+  Streamlit Application
+        |
+        +--------------------+
+        |                    |
+        v                    v
+ Authentication        Assessment Workflow
+        |                    |
+        v                    +-------------------+
+   User JSON               |                   |
+                           v                   v
+                         Exams               C++ Labs
+                           |                   |
+                           v                   v
+                 Continuous Auth       Compile / Execute
+                           |                   |
+                           v                   v
+                    LSTM Prediction     Hidden-Test Grading
+                           |                   |
+                           +---------+---------+
+                                     |
+                                     v
+                              JSON Persistence
+                                     |
+                                     v
+                               Faculty Reports
+```
 
 ---
 
-### 2. Student Registration
+## Behavioral Authentication Workflow
 
-Student registration is implemented as a three-step process.
+### Enrollment
 
-#### Step 1 — Account Details
+Student registration collects repeated samples of the phrase:
 
-The student provides:
-
-- Full name
-- Username
-- Enrollment number
-- Password
-- Faculty/course selection
-
-#### Step 2 — Behavioral Enrollment
-
-The student types:
-
-~~~text
+```text
 the quick brown fox jumps
-~~~
+```
 
-The phrase is entered repeatedly. The implementation targets **10 behavioral samples**.
+The registration interface asks the student to type the phrase exactly 10 times. Each captured sample is converted into the 13-feature representation used by the model.
 
-Each sample is converted into the 13-feature vector listed above.
+### Login Verification
 
-#### Step 3 — Registration Completion
+The student first enters username/password credentials and then completes behavioral phrase verification.
 
-The application:
+The model returns the probability assigned to the student's class. The authentication decision is accepted when the probability is at least `0.45`.
 
-1. Creates the student account.
-2. Saves the collected keystroke samples.
-3. Enrolls the student in the selected faculty course.
-4. Attempts to retrain the behavioral-authentication model.
+### Continuous Authentication
 
----
+During assessment sessions, the frontend collects recent keystroke events and sends periodic feature vectors back to Streamlit.
 
-## Student Login Flow
-
-Student login has an additional behavioral verification stage.
-
-~~~text
-Username + Password
-        ↓
-Credential Validation
-        ↓
-Behavioral Phrase Verification
-        ↓
-LSTM Prediction
-        ↓
-Confidence >= 0.45 ?
-     ↙        ↘
-   Yes         No
-    ↓           ↓
-Student Login  Retry
-                ↓
-          3 failed attempts
-                ↓
-              Block
-~~~
-
-If the behavioral model is not trained, the code allows the student to proceed without behavioral verification.
-
----
-
-## Exam Workflow
-
-The student:
-
-1. Opens an enrolled course.
-2. Selects an available exam.
-3. Starts a new exam session.
-4. Receives an exam session ID.
-5. Enters the identity-verification gate.
-6. Types the behavioral phrase.
-7. Must achieve at least `0.45` confidence.
-8. Enters the timed exam.
-9. Answers MCQs and/or descriptive questions.
-10. Is continuously monitored through typing behavior.
-11. Can submit manually.
-12. Is automatically submitted when the timer expires.
-13. Receives a submission/integrity summary.
-
-During an exam, continuous checks are scheduled every **30 seconds**. A check only produces an authentication event when enough recent keystrokes have been collected.
-
----
-
-## Dataset & Preprocessing
-
-The repository does not contain a conventional external behavioral-authentication dataset.
-
-Instead, `seed_demo.py` generates synthetic keystroke-feature samples from predefined typing profiles.
-
-The bundled demo configuration creates:
-
-- 3 student profiles
-- 15 samples per student
-- 45 total behavioral training samples
-
-The synthetic profiles differ primarily in dwell-time and flight-time distributions.
-
-These samples are used to train the initial LSTM model.
+The exam workflow schedules continuous checks every 30 seconds, subject to the application's minimum-event requirements.
 
 ---
 
@@ -449,56 +356,55 @@ These samples are used to train the initial LSTM model.
 - Total typing time
 - Number of keys
 
-The same feature logic is implemented in the JavaScript frontend so that captured browser data matches the Python model's expected feature order.
+The JavaScript frontend implements the corresponding browser-side feature calculation so that the produced vectors follow the model's expected feature order.
 
 ### Normalization
 
-During training:
+The model uses manual per-feature z-score normalization:
 
-~~~text
+```text
 X_scaled = (X - mean) / (std + 1e-8)
-~~~
+```
 
-The calculated means and standard deviations are stored in `metadata.json`.
+The learned mean and standard deviation arrays are saved in `metadata.json`.
 
-### Model Architecture
+### LSTM Architecture
 
-~~~text
-Input
-  Shape: (13, 1)
-      ↓
-LSTM
-  64 units
-  return_sequences=True
-      ↓
-Dropout
-  0.30
-      ↓
-LSTM
-  32 units
-      ↓
-Dropout
-  0.30
-      ↓
-Dense
-  32 units
-  ReLU
-      ↓
-Dropout
-  0.15
-      ↓
-Dense
-  N classes
-  Softmax
-~~~
+The implementation in `ml_model.py` builds the following Keras model:
+
+```text
+Input: (13, 1)
+    |
+    v
+LSTM(64, return_sequences=True)
+    |
+    v
+Dropout(0.30)
+    |
+    v
+LSTM(32)
+    |
+    v
+Dropout(0.30)
+    |
+    v
+Dense(32, ReLU)
+    |
+    v
+Dropout(0.15)
+    |
+    v
+Dense(number_of_classes, Softmax)
+```
 
 ### Training Configuration
 
 | Parameter | Value |
-|---|---:|
-| LSTM units | 64 |
-| Second LSTM units | 32 |
-| Dense units | 32 |
+| --- | --- |
+| Input features | 13 |
+| First LSTM | 64 units |
+| Second LSTM | 32 units |
+| Dense layer | 32 units, ReLU |
 | Dropout | 0.30 |
 | Final dropout | 0.15 |
 | Epochs | 80 |
@@ -506,80 +412,71 @@ Dense
 | Optimizer | Adam |
 | Learning rate | `1e-3` |
 | Loss | `sparse_categorical_crossentropy` |
-| Validation split | 15% when at least 10 samples are available |
+| Validation split | `0.15` when at least 10 samples exist |
 
-The model requires at least two distinct users before training.
-
-### Authentication Thresholds
-
-The model returns the probability associated with the authenticated user's class.
-
-The implemented decision threshold for acceptance is:
-
-~~~text
-confidence >= 0.45
-~~~
-
-Continuous monitoring additionally uses:
-
-- `>= 0.65` → Verified
-- `0.45 - < 0.65` → Warning
-- `< 0.45` → Flagged
+The model requires at least two distinct user labels before training.
 
 ---
 
-## Current Behavioral Model Artifact
+## Current Model Artifact
 
 The uploaded project contains:
 
-~~~text
+```text
 models/behavioral_auth_model_lstm/
 ├── lstm_model.keras
 └── metadata.json
-~~~
+```
 
-The bundled metadata contains three behavioral classes:
+The current model metadata contains these classes:
 
-~~~text
+```text
 alice_cs
 bob_cs
 charlie
-~~~
+```
 
-The repository does not contain a separate benchmark/evaluation dataset or persisted test metrics, so no independent accuracy, precision, recall, ROC-AUC, or similar performance claims are made here.
+The repository does not include a separate held-out benchmark dataset or a persisted evaluation report. No independent accuracy, precision, recall, ROC-AUC, or similar benchmark is therefore claimed in this README.
 
 ---
 
-## Coding Lab Workflow
+## Dataset & Preprocessing
 
-A student opens a coding lab and selects one of its problems.
+The repository does not contain an external behavioral-keystroke dataset.
+
+Instead, `seed_demo.py` synthesizes training vectors from three predefined typing profiles:
+
+- `alice_cs`
+- `bob_cs`
+- `charlie`
+
+The seed script generates 15 synthetic samples per student, giving 45 behavioral samples before model training.
+
+The generated samples contain the same 13 features used during inference. `BehavioralAuthModel.fit()` then computes the training mean/std, normalizes the features, reshapes them to `(samples, 13, 1)`, and trains the LSTM classifier.
+
+---
+
+## C++ Coding Workflow
 
 ### Run
 
-The **Run** action:
-
-1. Sends the current code and custom stdin to Streamlit.
-2. Calls `CppCompiler.compile_and_run()`.
-3. Executes the code using the configured compiler backend.
-4. Returns stdout, stderr, compile errors, exit code, engine, timing, and success state.
-
-The Run operation uses the supplied/sample input only.
+The **Run** operation executes the current C++ code with the supplied input/sample input and returns compilation/runtime information.
 
 ### Submit
 
-The **Submit** action:
+The **Submit** operation:
 
-1. Sends the code to Streamlit.
+1. Sends the student's C++ code to the Streamlit application.
 2. Loads the selected problem's hidden test cases.
-3. Runs the program once for each test case.
-4. Compares normalized program output with expected output.
-5. Awards points for passing tests.
-6. Stores the complete submission record.
-7. Shows per-test results.
+3. Executes the code against each hidden test.
+4. Normalizes and compares the program output with the expected output.
+5. Awards the configured points for passed tests.
+6. Stores the submission result.
+7. Displays the grading results in the UI.
 
 ---
 
-## C++ Compilation Backends
+## C++ Execution Backends
 
 `compiler.py` supports three execution engines.
 
@@ -587,102 +484,79 @@ The **Submit** action:
 
 The local backend searches for:
 
-~~~text
+```text
 g++
-~~~
+```
 
 or:
 
-~~~text
+```text
 clang++
-~~~
+```
 
-It compiles with:
+Compilation uses:
 
-~~~text
+```text
 -std=c++17
 -O2
 -pipe
-~~~
-
-and removes temporary source and executable files afterward.
+```
 
 ### Piston
 
 The project integrates with:
 
-~~~text
+```text
 https://emkc.org/api/v2/piston/execute
-~~~
+```
 
-with:
-
-~~~text
-language = cpp
-version = 10.2.0
-~~~
+using C++ version `10.2.0` in the implementation.
 
 ### Judge0
 
-The project integrates with:
+The project integrates with Judge0 through RapidAPI:
 
-~~~text
+```text
 https://judge0-ce.p.rapidapi.com/submissions
-~~~
+```
 
-with language ID:
+The implementation uses C++ language ID `54` and polls the submission result using the returned token.
 
-~~~text
-54
-~~~
-
-Judge0 requires:
-
-~~~text
-JUDGE0_API_KEY
-~~~
+Judge0 requires the `JUDGE0_API_KEY` environment variable.
 
 ---
 
-## Actual Runtime Engine Order
+## Runtime Engine Order
 
-The generic `CppCompiler` supports a configurable order.
+The `CppCompiler` class supports a local-first mode.
 
-However, the Streamlit application explicitly creates:
+The Streamlit application currently initializes the compiler with `prefer_local=True`, so the application attempts execution in this order:
 
-~~~python
-CppCompiler(prefer_local=True)
-~~~
-
-Therefore, the application attempts engines in this order:
-
-~~~text
+```text
 1. Local g++ / clang++
 2. Piston
 3. Judge0
-~~~
+```
 
-Judge0 is skipped when `JUDGE0_API_KEY` is unavailable.
+Judge0 is skipped when `JUDGE0_API_KEY` is not configured.
 
 ---
 
 ## API Documentation
 
-TrueTestAuth does **not** expose a public REST API.
+TrueTestAuth does **not** expose a public REST API of its own.
 
-The application is built as a Streamlit application, and the custom browser component communicates with Streamlit through the Streamlit component protocol.
+The external APIs used by the compiler module are:
 
-### External APIs
+| Service | Method | Endpoint / Purpose |
+| --- | --- | --- |
+| Piston | `POST` | `/api/v2/piston/execute` — compile and execute C++ |
+| Judge0 | `POST` | `/submissions` — create a compilation/execution submission |
+| Judge0 | `GET` | `/submissions/{token}` — poll execution result |
 
-| Service | Method | Purpose |
-|---|---|---|
-| Piston | `POST /api/v2/piston/execute` | Remote C++ compilation/execution |
-| Judge0 | `POST /submissions` | Submit C++ execution job |
-| Judge0 | `GET /submissions/{token}` | Poll Judge0 execution result |
+The custom frontend also communicates with Streamlit using internal component events such as:
 
-The frontend also sends internal application events such as:
-
-~~~text
+```text
 enrollment_sample
 verify_phrase
 exam_continuous_check
@@ -692,295 +566,91 @@ lab_run
 lab_submit
 lab_continuous_check
 lab_paste
-~~~
+```
 
-These are internal application events, not public HTTP endpoints.
+These are application events, not public HTTP API endpoints.
 
 ---
 
 ## Data Storage
 
-TrueTestAuth uses local JSON persistence instead of a relational or NoSQL database.
+The project uses local JSON files as its persistence layer.
 
-### User Data
+### `data/users.json`
 
-`data/users.json`
-
-Stores:
+Stores account information including:
 
 - Username
-- SHA-256 password hash
+- Password hash
 - Full name
 - Role
-- Course information
-- Enrollment number
+- Course name where applicable
+- Enrollment number where applicable
 - Creation timestamp
 - Behavioral samples
 - Enrollment state
 
-### Course Enrollment
+### `data/enrollments.json`
 
-`data/enrollments.json`
+Stores student-to-faculty enrollment relationships.
 
-Stores student/faculty course relationships.
+### `data/exams.json`
 
-### Exams
+Stores exam metadata, timing, questions, MCQ options/correct answers, marks, and status.
 
-`data/exams.json`
+### `data/labs.json`
 
-Stores:
+Stores coding-lab metadata and problem definitions, including statements, limits, sample tests, hidden tests, starter code, and total points.
 
-- Exam metadata
-- Questions
-- Question type
-- Options
-- Correct MCQ answer
-- Marks
-- Status
-- Timing
+### Runtime Files
 
-### Labs
+The application can create:
 
-`data/labs.json`
-
-Stores:
-
-- Lab metadata
-- Problems
-- Difficulty
-- Statements
-- Time limits
-- Memory limits
-- Sample tests
-- Hidden tests
-- Starter code
-- Total points
-
-### Runtime Records
-
-The application creates:
-
-~~~text
+```text
 data/submissions.json
 data/lab_submissions.json
 data/auth_logs.json
 data/cp_logs.json
-~~~
+```
 
-These store exam submissions, coding-lab submissions, authentication events, and clipboard events.
-
----
-
-## Installation & Setup
-
-### Prerequisites
-
-The repository's development container is configured around **Python 3.11**.
-
-For local execution, install:
-
-- Python
-- A C++17 compiler such as `g++` or `clang++`
-
-A local C++ compiler is not strictly required if a configured remote execution backend is available.
-
-### Clone the Repository
-
-~~~bash
-git clone https://github.com/erharsh2104/TrueTestAuth.git
-cd TrueTestAuth
-~~~
-
-### Create a Virtual Environment
-
-#### Windows
-
-~~~powershell
-python -m venv .venv
-.venv\Scripts\activate
-~~~
-
-#### Linux / macOS
-
-~~~bash
-python3 -m venv .venv
-source .venv/bin/activate
-~~~
-
-### Install Dependencies
-
-~~~bash
-pip install -r requirements.txt
-~~~
-
----
-
-## Environment Variables
-
-Create a `.env` file based on `.env.example` when Judge0 integration is required.
-
-~~~text
-JUDGE0_API_KEY=your_judge0_api_key
-~~~
-
-The application uses `python-dotenv` to load environment variables.
-
-Do not commit `.env` files or API credentials to Git.
-
----
-
-## Initialize Demo Data
-
-The project provides:
-
-~~~bash
-python seed_demo.py
-~~~
-
-The script:
-
-1. Creates demo faculty/student accounts when required.
-2. Generates synthetic behavioral samples.
-3. Enrolls students in the demo course.
-4. Trains the behavioral-authentication LSTM.
-5. Saves the trained model.
-6. Creates the demo exam.
-7. Creates the demo coding lab.
-
-The script can be rerun to rebuild the demo model/data.
-
----
-
-## How to Run
-
-Start the application with:
-
-~~~bash
-streamlit run app.py
-~~~
-
-The Streamlit configuration uses port:
-
-~~~text
-8501
-~~~
-
-The application is normally available at:
-
-~~~text
-http://localhost:8501
-~~~
-
----
-
-## Usage
-
-### Faculty
-
-1. Register or log in as faculty.
-2. Open the faculty dashboard.
-3. Create/manage exams.
-4. Create/manage coding labs.
-5. Review student submissions.
-6. Inspect behavioral-authentication reports.
-7. Review course and student information.
-
-### Student
-
-1. Register using a faculty/course.
-2. Complete behavioral enrollment.
-3. Log in using username/password.
-4. Complete behavioral verification.
-5. Open an available exam or coding lab.
-6. Complete the assessment.
-7. Submit the assessment.
-8. Review the resulting submission/integrity information.
-
----
-
-## Demo Data
-
-The uploaded project contains demo data for:
-
-### Faculty
-
-~~~text
-prof_sharma
-~~~
-
-### Students
-
-~~~text
-alice_cs
-bob_cs
-charlie
-~~~
-
-The project also contains:
-
-- 1 demo course enrollment setup
-- 1 demo exam
-- 1 demo coding lab
-- 3 coding problems
-- A trained behavioral-authentication model
-
-Credentials are intentionally not documented in this README.
-
----
-
-## Demo Coding Lab
-
-The seeded demo lab contains:
-
-| Problem | Difficulty |
-|---|---|
-| Hello, World! | Easy |
-| Sum of N Numbers | Medium |
-| Palindrome Check | Hard |
-
-The lab includes hidden test cases and point allocations for automated evaluation.
+These store exam submissions, lab submissions, authentication records, and copy/paste event records.
 
 ---
 
 ## Integrity Score
 
-The completed-exam integrity score is calculated using:
+The completed-exam integrity calculation is implemented in `DataManager.calculate_integrity_score()`.
 
-1. Average behavioral confidence.
-2. Number of paste events.
+### Behavioral Component
 
-### Behavioral Score
+```text
+behavioral_score = average_confidence * 100
+```
 
-~~~text
-behavioral_score = average_confidence × 100
-~~~
+### Clipboard Component
 
-### Paste Penalty
-
-~~~text
-0 paste events  → 100
-1 paste event   → 80
-2 paste events  → 55
-3+ paste events → 20
-~~~
+```text
+0 paste events  -> 100
+1 paste event   -> 80
+2 paste events  -> 55
+3+ paste events -> 20
+```
 
 ### Final Score
 
-~~~text
-integrity_score =
-    behavioral_score × 0.60
-    + paste_penalty × 0.40
-~~~
+```text
+integrity_score = behavioral_score * 0.6 + paste_penalty * 0.4
+```
 
 ### Classification
 
 | Integrity Score | Classification |
-|---|---|
+| --- | --- |
 | `>= 70` | High |
 | `40 - < 70` | Suspicious |
 | `< 40` | Flagged |
 
-These classifications are application-defined labels.
+These labels are defined by the application's current implementation.
 
 ---
 
@@ -990,256 +660,360 @@ The faculty reporting workflow can display:
 
 - Average authentication confidence
 - Minimum authentication confidence
-- Number of authentication checks
-- Number of flags
+- Authentication-check count
+- Flag count
 - Authentication timeline
-- Exam-level summary
+- Per-exam summary
 - Academic history
-- CSV report download
+- CSV export
+
+---
+
+## Installation & Setup
+
+### Prerequisites
+
+The repository's development container is based on Python 3.11.
+
+For local development, install:
+
+- Python 3.11-compatible environment
+- `g++` or `clang++` for local C++ execution
+
+### Clone
+
+```bash
+git clone https://github.com/erharsh2104/TrueTestAuth.git
+cd TrueTestAuth
+```
+
+### Create a Virtual Environment
+
+#### Windows PowerShell
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+#### Linux / macOS
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### Install Python Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+The repository currently specifies:
+
+- `streamlit>=1.32.0`
+- `tensorflow-cpu>=2.16.0,<2.21`
+- `numpy>=1.26.0,<2.4`
+- `protobuf>=4.25.3,<7`
+- `pandas>=2.1.0`
+- `requests>=2.31.0`
+- `python-dotenv>=1.0.0`
+- `pdfplumber>=0.10.0`
+
+---
+
+## Environment Variables
+
+Copy `.env.example` to `.env` when Judge0 integration is required:
+
+```bash
+cp .env.example .env
+```
+
+Then set:
+
+```text
+JUDGE0_API_KEY=your_judge0_api_key
+```
+
+No API key or secret is included in this README.
+
+The current `.env.example` also contains a commented legacy `MODEL_PATH` example, but the active application code currently constructs its model path directly rather than reading `MODEL_PATH` from the environment.
+
+---
+
+## Initialize Demo Data
+
+The project provides a demo-seeding script:
+
+```bash
+python seed_demo.py
+```
+
+It creates or updates the demo environment by:
+
+1. Creating the demo faculty account when needed.
+2. Creating the demo student accounts when needed.
+3. Generating synthetic behavioral samples.
+4. Enrolling the students in the demo course.
+5. Training and saving the LSTM behavioral model.
+6. Creating the demo exam.
+7. Creating the demo coding lab.
+
+---
+
+## Run the Application
+
+Start the Streamlit application with:
+
+```bash
+streamlit run app.py
+```
+
+The project configures Streamlit to use port `8501`.
+
+Open:
+
+```text
+http://localhost:8501
+```
+
+---
+
+## Usage
+
+### Faculty Workflow
+
+1. Register or log in as faculty.
+2. Open the faculty dashboard.
+3. Create or manage exams.
+4. Create or manage coding labs.
+5. Review exam and lab submissions.
+6. Inspect authentication and integrity reports.
+7. Review course/student information.
+
+### Student Workflow
+
+1. Register through the faculty/course selection flow.
+2. Complete behavioral enrollment by typing the required phrase repeatedly.
+3. Log in with the registered credentials.
+4. Complete behavioral verification.
+5. Open an available exam or coding lab.
+6. Complete the assessment while behavioral checks are active.
+7. Submit the assessment.
+8. Review the resulting submission/integrity information.
+
+---
+
+## Demo Environment
+
+The repository contains demo data for:
+
+### Faculty
+
+```text
+prof_sharma
+```
+
+### Students
+
+```text
+alice_cs
+bob_cs
+charlie
+```
+
+The seeded course is:
+
+```text
+CS301 - Data Structures
+```
+
+The demo exam is:
+
+```text
+Mid-Semester Exam — Data Structures
+```
+
+The demo lab is:
+
+```text
+Lab 1 — Basic C++ Programming
+```
+
+The seeded lab contains:
+
+| Problem | Difficulty |
+| --- | --- |
+| Hello, World! | Easy |
+| Sum of N Numbers | Medium |
+| Palindrome Check | Hard |
+
+Demo credentials exist in `seed_demo.py`; they are intentionally not reproduced here.
 
 ---
 
 ## Streamlit Configuration
 
-`.streamlit/config.toml` configures:
+`.streamlit/config.toml` currently specifies:
 
-~~~text
-Theme: dark
-Headless mode: true
-Port: 8501
-Browser usage statistics: disabled
-~~~
+```text
+theme.base = "dark"
+server.headless = true
+server.port = 8501
+browser.gatherUsageStats = false
+```
 
 ---
 
 ## Development Container
 
-The repository includes:
+The repository includes `.devcontainer/devcontainer.json`.
 
-~~~text
-.devcontainer/devcontainer.json
-~~~
+The configuration uses:
 
-The configuration uses a Python 3.11 development image and installs system/Python dependencies defined by:
+```text
+mcr.microsoft.com/devcontainers/python:1-3.11-bookworm
+```
 
-~~~text
-packages.txt
-requirements.txt
-~~~
+It installs system packages listed in `packages.txt`, which currently contains:
 
-`packages.txt` currently includes:
-
-~~~text
+```text
 g++
-~~~
+```
 
-The development container also forwards port `8501`.
+It also installs Python dependencies from `requirements.txt` and forwards port `8501` for the Streamlit application.
 
 ---
 
 ## Security Considerations
 
-The current implementation is intended for an academic/demo environment and requires additional hardening before production deployment.
+The uploaded implementation is an academic/demo application and should be hardened before production use.
 
 ### Password Storage
 
-Passwords are hashed using SHA-256.
+`data_manager.py` hashes passwords using SHA-256. The implementation does not use a salted password-hashing scheme such as Argon2, bcrypt, or scrypt.
 
-The implementation does not use a salted password hashing algorithm such as:
+### JSON Persistence
 
-- Argon2
-- bcrypt
-- scrypt
-
-### Local JSON Persistence
-
-Application data is stored in JSON files.
-
-This provides simple persistence but does not provide the concurrency control, transaction guarantees, role-based database permissions, or auditing capabilities expected from a production database.
+Application state is stored in local JSON files. This is simple for a demo but does not provide the database transaction, concurrency, access-control, and auditing features normally required in production.
 
 ### Client-Side Restrictions
 
-Copy/paste and interaction restrictions are implemented in JavaScript.
-
-Because these controls execute on the client side, they should not be treated as a complete anti-cheating or security boundary.
+Clipboard and browser interaction restrictions are implemented in JavaScript and therefore are not a complete security boundary against a modified or privileged client.
 
 ### C++ Code Execution
 
-The local execution backend uses subprocess execution for submitted C++ programs.
-
-A production deployment should isolate untrusted code inside a hardened sandbox with:
-
-- CPU limits
-- Memory limits
-- Filesystem restrictions
-- Network restrictions
-- Process isolation
-- Execution timeouts
+The local execution path launches submitted C++ programs through subprocesses. Executing untrusted code in production would require stronger isolation and resource controls.
 
 ---
 
 ## Limitations
 
-The current implementation has several limitations:
+The current repository has the following implementation limitations:
 
-- Demo behavioral-authentication training data is synthetic.
-- No real-world behavioral-keystroke dataset is bundled.
-- No separate benchmark/test dataset is included.
-- No persisted model evaluation metrics are included.
-- The authentication model is a multi-class LSTM classifier.
-- Password hashing uses SHA-256 without salting.
-- Persistence uses local JSON files.
+- Demo behavioral training data is synthetic.
+- No external real-world keystroke dataset is bundled.
+- No independent held-out benchmark dataset is included.
+- No persisted model evaluation report is included.
+- Behavioral authentication is implemented as a multi-class LSTM classifier.
+- Passwords use SHA-256 without a salt.
+- Application persistence uses local JSON files.
 - No public REST API is implemented.
-- Client-side clipboard protection is not a complete security mechanism.
-- Local C++ execution is not implemented as a production-grade sandbox.
-- The configured memory limit is part of the lab problem definition but is not enforced as an operating-system-level memory restriction by the local compiler backend.
+- Browser-side clipboard blocking is not a complete anti-cheating mechanism.
+- The local C++ execution backend is not a production sandbox.
+- Problem memory limits are stored as configuration but are not enforced as operating-system-level memory restrictions in the local subprocess backend.
 - No automated unit/integration test suite is included.
-- `.gitignore` excludes runtime data/model assets, so a fresh clone should use `seed_demo.py` to regenerate the demo environment.
+- `.gitignore` ignores the runtime JSON and LSTM model directories/files, so a fresh clone should regenerate demo runtime assets with `seed_demo.py`.
 
 ---
 
 ## Future Improvements
 
-Potential improvements include:
+Potential improvements consistent with the current architecture include:
 
-- Replace JSON persistence with PostgreSQL/MySQL or another production database.
+- Replace JSON persistence with a production database.
 - Use Argon2, bcrypt, or scrypt for password hashing.
-- Implement secure sandboxed C++ execution.
-- Enforce CPU, RAM, filesystem, and network restrictions.
-- Use a real keystroke-dynamics dataset.
-- Add independent training/validation/test splits.
-- Add formal model evaluation and calibration.
-- Improve behavioral verification using a dedicated verification architecture.
-- Add automated unit and integration testing.
-- Introduce stronger session management and authorization.
-- Move configuration fully into environment variables.
-- Add a dedicated backend API layer if external clients are required.
+- Add hardened sandboxing for C++ execution.
+- Enforce CPU, memory, filesystem, and network limits during code execution.
+- Add a real keystroke-dynamics dataset and independent evaluation split.
+- Add model evaluation, calibration, and authentication-performance reporting.
+- Add stronger session and authorization controls.
+- Add automated unit and integration tests.
+- Move active configuration values fully into environment variables.
+- Introduce a backend API layer if external clients are required.
 
 ---
 
 ## Results / Screenshots
 
-The uploaded project does not contain a dedicated screenshots folder or benchmark-results report.
+The uploaded repository does not contain a dedicated screenshots directory or a persisted benchmark-results report.
 
-The repository does contain the trained model:
+The project does contain a trained model artifact:
 
-~~~text
+```text
 models/behavioral_auth_model_lstm/lstm_model.keras
-~~~
+```
 
-The training code reports training/validation accuracy while training, but these values are not persisted as a formal evaluation report.
-
-Therefore, this README does not claim a specific model accuracy or other benchmark metric.
+The training code returns final training and validation accuracy during execution, but those values are not stored as a standalone evaluation report in the repository. Accordingly, this README does not claim a specific benchmark accuracy.
 
 ---
 
 ## License
 
-No `LICENSE` file or explicit software license is present in the uploaded project.
+No `LICENSE` file or explicit software license is present in the uploaded repository.
 
-Therefore, the repository should currently be considered **unlicensed unless a license is added by the project owner**.
+Until a license is added, the repository should be treated as **unlicensed**.
 
 ---
 
 ## Contributors
 
-The repository Git history identifies:
+The repository's Git history identifies:
 
 - **Harsh Tripathi**
 
-Additional contribution history can be viewed through the Git commit history.
+Additional history can be viewed through the repository's Git log.
 
 ---
 
 ## Important Files
 
-| File | Purpose |
-|---|---|
-| `app.py` | Main Streamlit application and workflow router |
-| `compiler.py` | C++ compilation, execution, fallback engines, and grading |
+| File | Responsibility |
+| --- | --- |
+| `app.py` | Main Streamlit application and workflow controller |
+| `compiler.py` | C++ compilation, execution backends, result handling, and grading |
 | `data_manager.py` | JSON persistence and data operations |
-| `ml_model.py` | Behavioral feature extraction and LSTM authentication |
-| `seed_demo.py` | Demo data, model training, exam, and lab initialization |
-| `ui_components.py` | Reusable UI components |
+| `ml_model.py` | Keystroke feature extraction and LSTM behavioral authentication |
+| `seed_demo.py` | Demo data, model training, exam, and coding-lab seeding |
+| `ui_components.py` | Reusable interface components and layouts |
 | `frontend/index.html` | Browser typing capture and assessment interface |
-| `requirements.txt` | Python package dependencies |
-| `packages.txt` | System dependency list |
+| `requirements.txt` | Python dependencies |
+| `packages.txt` | System package dependency list |
 | `.env.example` | Environment-variable template |
 | `.streamlit/config.toml` | Streamlit configuration |
-
----
-
-## End-to-End Workflow
-
-~~~text
-                    ┌──────────────────────┐
-                    │      User Browser    │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │     Streamlit App    │
-                    │        app.py         │
-                    └───────┬───────┬──────┘
-                            │       │
-             ┌──────────────┘       └───────────────┐
-             ▼                                      ▼
-   ┌────────────────────┐                 ┌────────────────────┐
-   │ Behavioral Auth    │                 │  DataManager       │
-   │   ml_model.py      │                 │ data_manager.py    │
-   └─────────┬──────────┘                 └─────────┬──────────┘
-             │                                      │
-             ▼                                      ▼
-   ┌────────────────────┐                 ┌────────────────────┐
-   │ LSTM Model         │                 │ Local JSON Files   │
-   │ .keras + metadata  │                 │ users/exams/labs   │
-   └────────────────────┘                 │ submissions/logs   │
-                                          └────────────────────┘
-
-             Student Coding Submission
-                         │
-                         ▼
-                ┌──────────────────┐
-                │   CppCompiler    │
-                │   compiler.py    │
-                └────────┬─────────┘
-                         │
-          ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-      Local g++       Piston         Judge0
-          │              │              │
-          └──────────────┼──────────────┘
-                         ▼
-                Compile / Run Result
-                         │
-                         ▼
-                Hidden-Test Grading
-                         │
-                         ▼
-                Lab Submission Data
-~~~
+| `.devcontainer/devcontainer.json` | Development-container configuration |
 
 ---
 
 ## Project Status
 
-The current codebase provides an academic/demo implementation of a behavioral-authenticated assessment platform with:
+The current codebase provides an academic/demo assessment platform with:
 
 - Faculty and student roles
 - Behavioral enrollment
 - Behavioral login verification
 - Continuous behavioral monitoring
-- Proctored exams
-- MCQ auto-grading
-- Descriptive-question storage
+- Timed exams
+- MCQ grading
+- Descriptive-answer storage
 - C++ coding labs
-- Automated hidden-test grading
+- Hidden-test auto-grading
 - Local JSON persistence
-- Faculty reporting
+- Faculty reports
 - Clipboard-event logging
 - TensorFlow/Keras LSTM authentication
 - Local and remote C++ execution backends
-- Custom Streamlit frontend components
+- A custom Streamlit frontend component
 
-This README is intentionally based on the implementation present in the project and does not add unsupported technologies, APIs, results, or features.
-```
+This README is based on the implementation present in the uploaded project and intentionally avoids unsupported features, technologies, metrics, APIs, or claims.
