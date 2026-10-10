@@ -63,7 +63,7 @@ The application extracts a 13-dimensional feature vector from typing events:
 12. `total_time_ms`
 13. `n_keys`
 
-The resulting vector is normalized and passed to the LSTM model for user-specific probability estimation.
+The vector is scored against the claimed user's own typing profile (and, for fixed-phrase samples, an LSTM) to produce a 0-1 confidence.
 
 ### Continuous Verification
 
@@ -326,7 +326,7 @@ The registration interface asks the student to type the phrase exactly 10 times.
 
 The student first enters username/password credentials and then completes behavioral phrase verification.
 
-The model returns the probability assigned to the student's class. The authentication decision is accepted when the probability is at least `0.45`.
+The model returns a 0-1 confidence for the claimed user (see *Verification Score*). The login is accepted when the confidence is at least `0.45`.
 
 ### Continuous Authentication
 
@@ -337,6 +337,15 @@ The exam workflow schedules continuous checks every 30 seconds, subject to the a
 ---
 
 ## Model / Algorithm Details
+
+### Verification Score
+
+Verification answers *"is this sample this user's?"*, not *"who is this?"*.
+
+- **Per-user profile:** at enrolment the mean and spread of each feature over the user's samples are stored in `models/behavioral_auth_model_lstm/profiles.json`. A new sample is scored by its RMS z-distance from the profile, `score = exp(-0.5 * (d / 2)^2)`. Each feature has a minimum tolerated spread (7-30 % of the user's mean) so very consistent typists are not over-strict. Adding or retraining other users never changes a user's score, and a single enrolled user is enough.
+- **Fixed-phrase context** (login, exam identity gate): 8 features are compared (`mean/median/std` dwell and flight, typing speed, dwell/flight ratio) and combined with the LSTM: `confidence = 0.75 * profile score + 0.25 * LSTM probability`. The small LSTM weight means it can neither lock out a genuine user nor admit an impostor on its own.
+- **Free-text context** (continuous checks during exams and labs): only key-hold time (`mean_dwell`, `median_dwell`) is compared, with 1.6x wider tolerance, because flight rhythm differs between the enrolment phrase and free typing. The LSTM is not used here.
+- Typing gaps longer than 1.5 s are treated as pauses and excluded from flight and timing features.
 
 ### Feature Extraction
 
@@ -738,7 +747,7 @@ JUDGE0_API_KEY=your_judge0_api_key
 
 No API key or secret is included in this README.
 
-The current `.env.example` also contains a commented legacy `MODEL_PATH` example, but the active application code currently constructs its model path directly rather than reading `MODEL_PATH` from the environment.
+`MODEL_PATH` (optional) overrides the model directory; it defaults to `models/behavioral_auth_model_lstm`.
 
 ---
 
@@ -892,7 +901,7 @@ The uploaded implementation is an academic/demo application and should be harden
 
 ### Password Storage
 
-`data_manager.py` hashes passwords using SHA-256. The implementation does not use a salted password-hashing scheme such as Argon2, bcrypt, or scrypt.
+`data_manager.py` hashes passwords with salted PBKDF2-HMAC-SHA256 (200,000 iterations). Legacy unsalted SHA-256 hashes are still accepted and are upgraded automatically on the user's next successful login.
 
 ### JSON Persistence
 
@@ -904,7 +913,7 @@ Clipboard and browser interaction restrictions are implemented in JavaScript and
 
 ### C++ Code Execution
 
-The local execution path launches submitted C++ programs through subprocesses. Executing untrusted code in production would require stronger isolation and resource controls.
+The local execution path launches submitted C++ programs through subprocesses. On Linux/macOS it applies CPU-time, address-space (memory), file-size and process-count rlimits, a stripped environment, and an output cap; on Windows only the wall-clock timeout and output cap apply. This is not a full sandbox: executing untrusted code in production still requires container/seccomp-level isolation.
 
 ---
 
@@ -916,13 +925,12 @@ The current repository has the following implementation limitations:
 - No external real-world keystroke dataset is bundled.
 - No independent held-out benchmark dataset is included.
 - No persisted model evaluation report is included.
-- Behavioral authentication is implemented as a multi-class LSTM classifier.
-- Passwords use SHA-256 without a salt.
+- Verification uses aggregate timing features, so two users with almost identical typing speed and rhythm (within roughly 7-10 %) cannot be told apart; thresholds and tolerances are heuristics that have not been calibrated on real keystroke data.
 - Application persistence uses local JSON files.
 - No public REST API is implemented.
 - Browser-side clipboard blocking is not a complete anti-cheating mechanism.
 - The local C++ execution backend is not a production sandbox.
-- Problem memory limits are stored as configuration but are not enforced as operating-system-level memory restrictions in the local subprocess backend.
+- Problem memory limits are enforced via `RLIMIT_AS` only on Linux/macOS (with a 128 MB floor); they are not enforced on Windows or by the Piston/Judge0 backends.
 - No automated unit/integration test suite is included.
 - `.gitignore` ignores the runtime JSON and LSTM model directories/files, so a fresh clone should regenerate demo runtime assets with `seed_demo.py`.
 
@@ -933,7 +941,6 @@ The current repository has the following implementation limitations:
 Potential improvements consistent with the current architecture include:
 
 - Replace JSON persistence with a production database.
-- Use Argon2, bcrypt, or scrypt for password hashing.
 - Add hardened sandboxing for C++ execution.
 - Enforce CPU, memory, filesystem, and network limits during code execution.
 - Add a real keystroke-dynamics dataset and independent evaluation split.

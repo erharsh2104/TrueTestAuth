@@ -52,6 +52,7 @@ ENGINE_LOCAL = "Local g++"
 ENGINE_NONE = "None"
 
 DEFAULT_TIMEOUT = 5
+MAX_OUTPUT_CHARS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,26 @@ class CompileResult:
         }
 
 
+def _limit_resources(timeout: int, memory_mb: int):
+    """Return a preexec_fn applying POSIX rlimits to the student's program (None on Windows)."""
+    if sys.platform.startswith("win"):
+        return None
+
+    def _apply() -> None:
+        import resource
+
+        os.setsid()
+        resource.setrlimit(resource.RLIMIT_CPU, (timeout + 1, timeout + 1))
+        if memory_mb > 0:
+            # Floor keeps libstdc++ start-up from tripping tiny configured limits.
+            mem = max(memory_mb, 128) * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024,) * 2)
+        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+
+    return _apply
+
+
 def _empty(engine: str, msg: str) -> CompileResult:
     """Quick constructor for an error CompileResult on a given engine."""
     return CompileResult("", msg, "", -1, engine, 0, False)
@@ -99,6 +120,7 @@ class CppCompiler:
         code: str,
         stdin: str = "",
         timeout: int = DEFAULT_TIMEOUT,
+        memory_mb: int = 0,
     ) -> Dict[str, Any]:
         """Try every available engine in order; return the first usable result."""
         if not code or not code.strip():
@@ -112,7 +134,7 @@ class CppCompiler:
                 elif engine == ENGINE_PISTON:
                     res = self._piston(code, stdin, timeout)
                 elif engine == ENGINE_LOCAL:
-                    res = self._local(code, stdin, timeout)
+                    res = self._local(code, stdin, timeout, memory_mb)
                 else:
                     continue
             except Exception as exc:
@@ -229,7 +251,9 @@ class CppCompiler:
         )
 
     # ── Local g++ ───────────────────────────────────────────────────────────
-    def _local(self, code: str, stdin: str, timeout: int) -> Optional[CompileResult]:
+    def _local(
+        self, code: str, stdin: str, timeout: int, memory_mb: int = 0
+    ) -> Optional[CompileResult]:
         """Compile with g++/clang++ subprocess and run the binary."""
         if not self._gcc_path:
             return None
@@ -262,6 +286,13 @@ class CppCompiler:
                     text=True,
                     timeout=timeout,
                     check=False,
+                    cwd=tmp,
+                    env=(
+                        None
+                        if sys.platform.startswith("win")
+                        else {"PATH": os.environ.get("PATH", "")}
+                    ),
+                    preexec_fn=_limit_resources(timeout, memory_mb),
                 )
             except subprocess.TimeoutExpired:
                 return CompileResult(
@@ -269,7 +300,7 @@ class CppCompiler:
                     124, ENGINE_LOCAL, timeout * 1000, False,
                 )
             return CompileResult(
-                run.stdout, run.stderr, "",
+                run.stdout[:MAX_OUTPUT_CHARS], run.stderr[:MAX_OUTPUT_CHARS], "",
                 run.returncode, ENGINE_LOCAL,
                 int((time.time() - start) * 1000),
                 run.returncode == 0,
@@ -314,6 +345,7 @@ def grade_submission(
     code: str,
     test_cases: List[Dict[str, Any]],
     time_limit: int = DEFAULT_TIMEOUT,
+    memory_mb: int = 0,
 ) -> Dict[str, Any]:
     """Run `code` against each test case; return per-test results + score."""
     results: List[Dict[str, Any]] = []
@@ -325,7 +357,9 @@ def grade_submission(
         stdin = tc.get("input", "") or ""
         expected = (tc.get("expected_output") or tc.get("expected") or "").strip()
         points = int(tc.get("points", 0))
-        run = compiler.compile_and_run(code, stdin=stdin, timeout=time_limit)
+        run = compiler.compile_and_run(
+            code, stdin=stdin, timeout=time_limit, memory_mb=memory_mb
+        )
         engine_used = run.get("engine_used") or engine_used
         if run.get("compile_error"):
             compile_error = run["compile_error"]

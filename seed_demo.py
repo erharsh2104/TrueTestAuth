@@ -6,14 +6,13 @@ Run once before a presentation:
 
 from __future__ import annotations
 
-import os
 import random
 from typing import Dict, List
 
 import numpy as np
 
-from data_manager import DEFAULT_STARTER_CODE, DataManager
-from ml_model import BehavioralAuthModel
+from data_manager import DataManager
+from ml_model import DEFAULT_MODEL_DIR, BehavioralAuthModel
 
 
 # ── Per-user typing profiles ─────────────────────────────────────────────────
@@ -271,12 +270,7 @@ def main() -> None:
     np.random.seed(42)
     dm = DataManager()
     seed_users(dm)
-    model_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "models",
-        "behavioral_auth_model.pkl",
-    )
-    train_initial_model(dm, model_path)
+    train_initial_model(dm, DEFAULT_MODEL_DIR)
     seed_demo_exam(dm)
     seed_demo_lab(dm)
     print(

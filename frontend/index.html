@@ -464,14 +464,17 @@
                           const s = [...a].sort((x,y) => x-y);
                           const mid = Math.floor(s.length/2);
                           return s.length % 2 ? s[mid] : (s[mid-1]+s[mid])/2; };
-    const pos = flight.filter(f => f >= 0);
+    // Gaps over PAUSE_MS are pauses, not rhythm (keeps windowed free-text
+    // samples comparable to fixed-phrase enrolment; mirrors ml_model.py).
+    const PAUSE_MS = 1500;
+    const pos = flight.filter(f => f >= 0 && f <= PAUSE_MS);
     const meanDwell = mean(dwell), stdDwell = std(dwell);
     const medianDwell = median(dwell), maxDwell = Math.max(...dwell);
     const meanFlight = pos.length ? mean(pos) : 0;
     const stdFlight = std(pos), medianFlight = median(pos);
     const minFlight = pos.length ? Math.min(...pos) : 0;
     const nKeys = buf.length;
-    const totalTime = Math.max(1, buf[buf.length-1].upTime - buf[0].downTime);
+    const totalTime = Math.max(1, dwell.reduce((x,y) => x+y, 0) + pos.reduce((x,y) => x+y, 0));
     const wpm = (nKeys/5.0)/(totalTime/60000.0);
     const ratio = meanFlight > 0 ? meanDwell/meanFlight : 0;
     let rhythm = meanDwell > 0 ? 1 - (stdDwell/meanDwell) : 0;
@@ -643,6 +646,35 @@
       sendValue({ nonce: nonce(), kind: "verify_phrase",
                   username: args.username, features: computeFeatures(buffer) });
     };
+    box.focus(); autoHeight();
+  }
+
+  // ── Generic phrase-capture widget (login verify + enrolment samples) ───
+  function renderPhraseCapture(args) {
+    state.type = "phrase_capture";
+    app.innerHTML = `
+      <input id="typebox" class="txt typebox" autocomplete="off" spellcheck="false"
+             placeholder="Type the phrase here…"/>
+      <div class="row">
+        <button id="goBtn" class="btn" style="width:100%;">${escapeHtml(args.button_label || "Submit")}</button>
+      </div>
+      <div id="msg" class="msg" style="margin:0.5rem 0 0 0;text-align:center;"></div>`;
+    let buffer = [];
+    const box = document.getElementById("typebox");
+    const msg = document.getElementById("msg");
+    attachKeyCapture(box, buffer);
+    function submit() {
+      if (box.value.trim() !== args.phrase) {
+        msg.textContent = "Type the phrase exactly."; msg.className = "msg";
+        buffer.length = 0; box.value = ""; return;
+      }
+      sendValue({ nonce: nonce(), kind: args.kind, features: computeFeatures(buffer) });
+      buffer.length = 0; box.value = "";
+      msg.textContent = args.sent_text || "Processing…"; msg.className = "msg ok-msg";
+    }
+    box.addEventListener("keydown", e => { if (e.key === "Enter") e.preventDefault(); });
+    box.addEventListener("keyup", e => { if (e.key === "Enter") submit(); });
+    document.getElementById("goBtn").onclick = submit;
     box.focus(); autoHeight();
   }
 
@@ -854,7 +886,8 @@
     document.getElementById("btnRun").onclick = () => {
       sendValue({ nonce: nonce(), kind: "lab_run",
                   problem_id: args.problem_id, code: codeEl.value,
-                  stdin: stdinEl.value, time_limit: args.time_limit || 3 });
+                  stdin: stdinEl.value, time_limit: args.time_limit || 3,
+                  memory_limit: args.memory_limit || 0 });
       flashStatus("Compiling…");
     };
     document.getElementById("btnSubmit").onclick = () => {
@@ -961,6 +994,8 @@
       else updateEnrollment(args);
     } else if (t === "login") {
       if (state.type !== "login") renderLogin(args);
+    } else if (t === "phrase_capture") {
+      if (state.type !== "phrase_capture") renderPhraseCapture(args);
     } else if (t === "challenge") {
       if (state.type !== "challenge") renderChallenge(args);
     } else if (t === "exam_session") {

@@ -14,8 +14,10 @@ Files under data/:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -66,8 +68,33 @@ def _write_json(path: str, payload: Any) -> None:
     os.replace(tmp, path)
 
 
+_PBKDF2_ITERS = 200_000
+
+
 def _hash(pw: str) -> str:
-    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+    """Salted PBKDF2-HMAC-SHA256 hash, stored as `pbkdf2$iters$salt$digest`."""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", pw.encode("utf-8"), bytes.fromhex(salt), _PBKDF2_ITERS
+    ).hex()
+    return f"pbkdf2${_PBKDF2_ITERS}${salt}${digest}"
+
+
+def _verify(pw: str, stored: str) -> bool:
+    """Check `pw` against a stored hash (also accepts legacy unsalted SHA-256)."""
+    if not stored:
+        return False
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, iters, salt, digest = stored.split("$")
+            cand = hashlib.pbkdf2_hmac(
+                "sha256", pw.encode("utf-8"), bytes.fromhex(salt), int(iters)
+            ).hex()
+        except ValueError:
+            return False
+        return hmac.compare_digest(cand, digest)
+    legacy = hashlib.sha256(pw.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy, stored)
 
 
 # ── DataManager ──────────────────────────────────────────────────────────────
@@ -118,10 +145,14 @@ class DataManager:
         u = users.get(username)
         if not u:
             return None
-        if u.get("password_hash") != _hash(password):
+        if not _verify(password, u.get("password_hash", "")):
             return None
         if u.get("role") != role:
             return None
+        if not u["password_hash"].startswith("pbkdf2$"):
+            # Transparently upgrade legacy unsalted hashes on successful login.
+            u["password_hash"] = _hash(password)
+            self.save_users(users)
         return u
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
