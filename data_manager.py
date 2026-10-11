@@ -1,38 +1,39 @@
-"""JSON-backed persistence layer for TrueTestAuth.
+"""SQLite persistence layer for TrueTestAuth.
 
-Files under data/:
-  users.json            — user accounts (faculty + students)
-  exams.json            — exam definitions
-  labs.json             — lab problem definitions
-  submissions.json      — student exam submissions + auth logs
-  lab_submissions.json  — student lab submissions + test results
-  auth_logs.json        — per-session behavioural auth timeline
-  cp_logs.json          — copy-paste event logs
-  enrollments.json      — which students are in which faculty's course
+Everything lives in one file, ``data/truetestauth.db`` (Python's built-in
+``sqlite3``, no server and no extra package). Tables:
+
+  users             — accounts (faculty + students), password hash, enrolled flag
+  samples           — one row per keystroke-feature sample of a student
+  enrollments       — which students are in which faculty's course
+  exams             — exam definitions (questions stored as JSON text)
+  exam_submissions  — one row per (student, exam): answers, score, integrity
+  labs              — lab definitions (problems stored as JSON text)
+  lab_submissions   — every lab attempt with its test results
+  auth_logs         — behavioural-auth confidence timeline per session
+  cp_logs           — copy-paste events per session
+
+If the database is empty and the old ``data/*.json`` files exist, they are
+imported once, automatically (the JSON files are left untouched).
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
-# ── File paths ───────────────────────────────────────────────────────────────
+# ── Paths ────────────────────────────────────────────────────────────────────
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-EXAMS_FILE = os.path.join(DATA_DIR, "exams.json")
-LABS_FILE = os.path.join(DATA_DIR, "labs.json")
-SUBMISSIONS_FILE = os.path.join(DATA_DIR, "submissions.json")
-LAB_SUBMISSIONS_FILE = os.path.join(DATA_DIR, "lab_submissions.json")
-AUTH_LOG_FILE = os.path.join(DATA_DIR, "auth_logs.json")
-CP_LOG_FILE = os.path.join(DATA_DIR, "cp_logs.json")
-ENROLL_FILE = os.path.join(DATA_DIR, "enrollments.json")
+DB_FILE = os.path.join(DATA_DIR, "truetestauth.db")
 
 DEFAULT_STARTER_CODE: str = """#include <iostream>
 using namespace std;
@@ -43,31 +44,138 @@ int main() {
 }
 """
 
+FEATURE_ORDER = [
+    "mean_dwell", "std_dwell", "median_dwell", "max_dwell",
+    "mean_flight", "std_flight", "median_flight", "min_flight",
+    "typing_speed_wpm", "dwell_flight_ratio",
+    "rhythm_consistency", "total_time_ms", "n_keys",
+]
+ENROLL_AFTER_SAMPLES = 10
 
-# ── JSON helpers ─────────────────────────────────────────────────────────────
-def _ensure_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    username      TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    full_name     TEXT NOT NULL DEFAULT '',
+    role          TEXT NOT NULL,
+    course_name   TEXT,
+    enrollment_no TEXT,
+    created_at    REAL NOT NULL,
+    enrolled      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS samples (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    features TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_samples_user ON samples(username);
+
+CREATE TABLE IF NOT EXISTS enrollments (
+    student TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    faculty TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    since   REAL NOT NULL,
+    PRIMARY KEY (student, faculty)
+);
+CREATE INDEX IF NOT EXISTS idx_enroll_faculty ON enrollments(faculty);
+
+CREATE TABLE IF NOT EXISTS exams (
+    exam_id       TEXT PRIMARY KEY,
+    faculty       TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    subject       TEXT,
+    date          TEXT,
+    start_time    TEXT,
+    duration_mins INTEGER NOT NULL,
+    instructions  TEXT,
+    questions     TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'upcoming',
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exams_faculty ON exams(faculty);
+
+CREATE TABLE IF NOT EXISTS exam_submissions (
+    username   TEXT NOT NULL,
+    exam_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    answers    TEXT NOT NULL,
+    score      INTEGER NOT NULL DEFAULT 0,
+    integrity  TEXT,
+    avg_conf   REAL NOT NULL DEFAULT 0,
+    cp_count   INTEGER NOT NULL DEFAULT 0,
+    timestamp  REAL NOT NULL,
+    PRIMARY KEY (username, exam_id)
+);
+
+CREATE TABLE IF NOT EXISTS labs (
+    lab_id      TEXT PRIMARY KEY,
+    faculty     TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    course      TEXT,
+    deadline    TEXT,
+    description TEXT,
+    problems    TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_labs_faculty ON labs(faculty);
+
+CREATE TABLE IF NOT EXISTS lab_submissions (
+    submission_id TEXT PRIMARY KEY,
+    username      TEXT NOT NULL,
+    lab_id        TEXT NOT NULL,
+    problem_id    TEXT NOT NULL,
+    code          TEXT,
+    results       TEXT NOT NULL,
+    score         INTEGER NOT NULL DEFAULT 0,
+    max_score     INTEGER NOT NULL DEFAULT 0,
+    passed        INTEGER NOT NULL DEFAULT 0,
+    total         INTEGER NOT NULL DEFAULT 0,
+    compile_error TEXT,
+    engine_used   TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 1,
+    timestamp     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_labsub_user_prob ON lab_submissions(username, problem_id);
+CREATE INDEX IF NOT EXISTS idx_labsub_lab ON lab_submissions(lab_id);
+
+CREATE TABLE IF NOT EXISTS auth_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    username   TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    status     TEXT NOT NULL,
+    engine     TEXT NOT NULL DEFAULT 'continuous',
+    timestamp  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_user_session ON auth_logs(username, session_id);
+
+CREATE TABLE IF NOT EXISTS cp_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    username    TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    question_id TEXT,
+    chars       INTEGER NOT NULL DEFAULT 0,
+    timestamp   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cp_user_session ON cp_logs(username, session_id);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+_AUTH_COLS = "username, session_id, confidence, status, engine, timestamp"
+_CP_COLS = "username, session_id, event_type, question_id, chars, timestamp"
+_USER_UPDATABLE = {"password_hash", "full_name", "role", "course_name", "enrollment_no", "enrolled"}
+_EXAM_UPDATABLE = {
+    "faculty", "title", "subject", "date", "start_time", "duration_mins",
+    "instructions", "questions", "status",
+}
 
 
-def _read_json(path: str, default: Any) -> Any:
-    _ensure_dir()
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return default
-
-
-def _write_json(path: str, payload: Any) -> None:
-    _ensure_dir()
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
-    os.replace(tmp, path)
-
-
+# ── Password hashing ─────────────────────────────────────────────────────────
 _PBKDF2_ITERS = 200_000
 
 
@@ -97,19 +205,95 @@ def _verify(pw: str, stored: str) -> bool:
     return hmac.compare_digest(legacy, stored)
 
 
+# ── Small helpers ────────────────────────────────────────────────────────────
+def _dump(obj: Any) -> str:
+    return json.dumps(obj)
+
+
+def _load(text: Optional[str]) -> Any:
+    return json.loads(text) if text else None
+
+
+def _read_legacy_json(path: str, default: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _exam(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    d["questions"] = _load(d["questions"]) or []
+    return d
+
+
+def _lab(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    d["problems"] = _load(d["problems"]) or []
+    return d
+
+
+def _exam_sub(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    d["answers"] = _load(d["answers"]) or {}
+    d["integrity"] = _load(d["integrity"])
+    return d
+
+
+def _lab_sub(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    d["results"] = _load(d["results"]) or []
+    return d
+
+
 # ── DataManager ──────────────────────────────────────────────────────────────
 class DataManager:
-    """Single facade for all JSON-file CRUD across the app."""
+    """Single facade for all database access across the app.
+
+    Each call opens its own short connection, so one instance can safely be
+    shared by all Streamlit sessions/threads.
+    """
+
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        self.db_path = db_path or DB_FILE
+        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+        with self._conn() as con:
+            con.executescript(_SCHEMA)
+        self._auto_import_legacy_json()
+
+    @contextlib.contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        con = sqlite3.connect(self.db_path, timeout=30)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON")
+        try:
+            with con:  # commit on success, roll back on error
+                yield con
+        finally:
+            con.close()
 
     # ── Users ───────────────────────────────────────────────────────────────
-    def load_users(self) -> Dict[str, Dict]:
-        return _read_json(USERS_FILE, {})
+    @staticmethod
+    def _user_dict(con: sqlite3.Connection, row: sqlite3.Row, with_samples: bool) -> Dict[str, Any]:
+        d = dict(row)
+        d["enrolled"] = bool(d["enrolled"])
+        if with_samples:
+            d["samples"] = DataManager._samples(con, d["username"])
+        return d
 
-    def save_users(self, users: Dict[str, Dict]) -> None:
-        _write_json(USERS_FILE, users)
+    @staticmethod
+    def _samples(con: sqlite3.Connection, username: str) -> List[List[float]]:
+        rows = con.execute(
+            "SELECT features FROM samples WHERE username = ? ORDER BY id", (username,)
+        ).fetchall()
+        return [json.loads(r["features"]) for r in rows]
 
     def user_exists(self, username: str) -> bool:
-        return username in self.load_users()
+        with self._conn() as con:
+            return con.execute(
+                "SELECT 1 FROM users WHERE username = ?", (username,)
+            ).fetchone() is not None
 
     def register_user(
         self,
@@ -121,83 +305,99 @@ class DataManager:
         enrollment_no: Optional[str] = None,
     ) -> bool:
         """Create a new account; returns False if username is taken."""
-        users = self.load_users()
-        if username in users:
+        try:
+            with self._conn() as con:
+                con.execute(
+                    "INSERT INTO users (username, password_hash, full_name, role, course_name,"
+                    " enrollment_no, created_at, enrolled) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                    (username, _hash(password), full_name, role, course_name,
+                     enrollment_no, time.time()),
+                )
+            return True
+        except sqlite3.IntegrityError:
             return False
-        users[username] = {
-            "username": username,
-            "password_hash": _hash(password),
-            "full_name": full_name,
-            "role": role,
-            "course_name": course_name,
-            "enrollment_no": enrollment_no,
-            "created_at": time.time(),
-            "samples": [],
-            "enrolled": False,
-        }
-        self.save_users(users)
-        return True
 
     def login_user(
         self, username: str, password: str, role: str
     ) -> Optional[Dict[str, Any]]:
-        users = self.load_users()
-        u = users.get(username)
-        if not u:
-            return None
-        if not _verify(password, u.get("password_hash", "")):
-            return None
-        if u.get("role") != role:
-            return None
-        if not u["password_hash"].startswith("pbkdf2$"):
-            # Transparently upgrade legacy unsalted hashes on successful login.
-            u["password_hash"] = _hash(password)
-            self.save_users(users)
-        return u
+        with self._conn() as con:
+            row = con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            if not row:
+                return None
+            if not _verify(password, row["password_hash"]):
+                return None
+            if row["role"] != role:
+                return None
+            if not row["password_hash"].startswith("pbkdf2$"):
+                # Transparently upgrade legacy unsalted hashes on successful login.
+                con.execute(
+                    "UPDATE users SET password_hash = ? WHERE username = ?",
+                    (_hash(password), username),
+                )
+                row = con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            return self._user_dict(con, row, with_samples=True)
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
-        return self.load_users().get(username)
+        with self._conn() as con:
+            row = con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            return self._user_dict(con, row, with_samples=True) if row else None
 
     def update_user(self, username: str, updates: Dict[str, Any]) -> bool:
-        users = self.load_users()
-        if username not in users:
-            return False
-        users[username].update(updates)
-        self.save_users(users)
-        return True
+        unknown = set(updates) - _USER_UPDATABLE
+        if unknown:
+            raise ValueError(f"cannot update user fields: {sorted(unknown)}")
+        if not updates:
+            return self.user_exists(username)
+        values = dict(updates)
+        if "enrolled" in values:
+            values["enrolled"] = int(bool(values["enrolled"]))
+        sets = ", ".join(f"{k} = ?" for k in values)
+        with self._conn() as con:
+            cur = con.execute(
+                f"UPDATE users SET {sets} WHERE username = ?", (*values.values(), username)
+            )
+            return cur.rowcount > 0
+
+    def _users_by_role(self, role: str) -> List[Dict]:
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT * FROM users WHERE role = ? ORDER BY rowid", (role,)
+            ).fetchall()
+            return [self._user_dict(con, r, with_samples=False) for r in rows]
 
     def get_all_students(self) -> List[Dict]:
-        return [u for u in self.load_users().values() if u.get("role") == "student"]
+        return self._users_by_role("student")
 
     def get_all_faculty(self) -> List[Dict]:
         """Return list of all users with role='faculty'."""
-        return [u for u in self.load_users().values() if u.get("role") == "faculty"]
+        return self._users_by_role("faculty")
 
     def all_enrolled_users(self) -> List[str]:
-        return [u for u, p in self.load_users().items() if p.get("enrolled")]
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT username FROM users WHERE enrolled = 1 ORDER BY rowid"
+            ).fetchall()
+            return [r["username"] for r in rows]
 
     # ── Keystroke samples (for ML enrolment) ────────────────────────────────
     def add_sample(self, username: str, features: Any) -> int:
         """Append one keystroke-feature sample for `username`; returns count.
         Accepts both list and dict formats."""
-        users = self.load_users()
-        if username not in users:
-            return 0
-        # Convert dict features to ordered list if needed
         if isinstance(features, dict):
-            feature_order = [
-                "mean_dwell", "std_dwell", "median_dwell", "max_dwell",
-                "mean_flight", "std_flight", "median_flight", "min_flight",
-                "typing_speed_wpm", "dwell_flight_ratio",
-                "rhythm_consistency", "total_time_ms", "n_keys",
-            ]
-            features = [float(features.get(k, 0)) for k in feature_order]
-        users[username].setdefault("samples", []).append(features)
-        count = len(users[username]["samples"])
-        if count >= 10:
-            users[username]["enrolled"] = True
-        self.save_users(users)
-        return count
+            features = [float(features.get(k, 0)) for k in FEATURE_ORDER]
+        with self._conn() as con:
+            if con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone() is None:
+                return 0
+            con.execute(
+                "INSERT INTO samples (username, features) VALUES (?, ?)",
+                (username, _dump(list(features))),
+            )
+            count = con.execute(
+                "SELECT COUNT(*) FROM samples WHERE username = ?", (username,)
+            ).fetchone()[0]
+            if count >= ENROLL_AFTER_SAMPLES:
+                con.execute("UPDATE users SET enrolled = 1 WHERE username = ?", (username,))
+            return count
 
     def save_keystroke_samples(self, username: str, samples: List[Any]) -> int:
         """Bulk-save multiple keystroke samples. Returns final count."""
@@ -206,48 +406,39 @@ class DataManager:
         return len(self.get_samples(username))
 
     def get_samples(self, username: str) -> List[List[float]]:
-        return self.load_users().get(username, {}).get("samples", [])
+        with self._conn() as con:
+            return self._samples(con, username)
 
     # ── Enrolments ──────────────────────────────────────────────────────────
-    def _load_enrollments(self) -> List[Dict]:
-        return _read_json(ENROLL_FILE, [])
-
     def enroll_student(self, student_username: str, faculty_username: str) -> bool:
-        rows = self._load_enrollments()
-        if any(
-            r["student"] == student_username and r["faculty"] == faculty_username
-            for r in rows
-        ):
+        """Put a student in a faculty's course. False if either account is missing."""
+        try:
+            with self._conn() as con:
+                con.execute(
+                    "INSERT OR IGNORE INTO enrollments (student, faculty, since) VALUES (?, ?, ?)",
+                    (student_username, faculty_username, time.time()),
+                )
             return True
-        rows.append(
-            {
-                "student": student_username,
-                "faculty": faculty_username,
-                "since": time.time(),
-            }
-        )
-        _write_json(ENROLL_FILE, rows)
-        return True
+        except sqlite3.IntegrityError:
+            return False
 
     def get_student_courses(self, student_username: str) -> List[Dict]:
-        rows = self._load_enrollments()
-        users = self.load_users()
-        out = []
-        for r in rows:
-            if r["student"] == student_username:
-                f = users.get(r["faculty"])
-                if f:
-                    out.append(f)
-        return out
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT u.* FROM enrollments e JOIN users u ON u.username = e.faculty"
+                " WHERE e.student = ? ORDER BY e.rowid",
+                (student_username,),
+            ).fetchall()
+            return [self._user_dict(con, r, with_samples=False) for r in rows]
 
     def get_faculty_students(self, faculty_username: str) -> List[Dict]:
-        rows = self._load_enrollments()
-        users = self.load_users()
-        return [
-            users[r["student"]]
-            for r in rows
-            if r["faculty"] == faculty_username and r["student"] in users
-        ]
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT u.* FROM enrollments e JOIN users u ON u.username = e.student"
+                " WHERE e.faculty = ? ORDER BY e.rowid",
+                (faculty_username,),
+            ).fetchall()
+            return [self._user_dict(con, r, with_samples=False) for r in rows]
 
     def get_exams_for_student(self, student_username: str) -> List[Dict]:
         """Return all exams from courses student is enrolled in."""
@@ -283,12 +474,6 @@ class DataManager:
         return len(subs) > 0
 
     # ── Exams ───────────────────────────────────────────────────────────────
-    def load_exams(self) -> Dict[str, Dict]:
-        return _read_json(EXAMS_FILE, {})
-
-    def save_exams(self, exams: Dict[str, Dict]) -> None:
-        _write_json(EXAMS_FILE, exams)
-
     def create_exam(
         self,
         faculty_username: str,
@@ -300,54 +485,51 @@ class DataManager:
         questions: List[Dict],
         start_time: str = "10:00",
     ) -> str:
-        exams = self.load_exams()
         eid = uuid.uuid4().hex[:8]
-        exams[eid] = {
-            "exam_id": eid,
-            "faculty": faculty_username,
-            "title": title,
-            "subject": subject,
-            "date": date,
-            "start_time": start_time,
-            "duration_mins": int(duration_mins),
-            "instructions": instructions,
-            "questions": questions,
-            "status": "upcoming",
-            "created_at": time.time(),
-        }
-        self.save_exams(exams)
+        with self._conn() as con:
+            con.execute(
+                "INSERT INTO exams (exam_id, faculty, title, subject, date, start_time,"
+                " duration_mins, instructions, questions, status, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'upcoming', ?)",
+                (eid, faculty_username, title, subject, date, start_time,
+                 int(duration_mins), instructions, _dump(questions), time.time()),
+            )
         return eid
 
     def get_exam(self, exam_id: str) -> Optional[Dict]:
-        return self.load_exams().get(exam_id)
+        with self._conn() as con:
+            row = con.execute("SELECT * FROM exams WHERE exam_id = ?", (exam_id,)).fetchone()
+            return _exam(row) if row else None
 
     def get_exams(self, faculty_username: Optional[str] = None) -> List[Dict]:
-        exams = list(self.load_exams().values())
+        sql, args = "SELECT * FROM exams", ()
         if faculty_username:
-            exams = [e for e in exams if e.get("faculty") == faculty_username]
-        exams.sort(key=lambda e: e.get("created_at", 0), reverse=True)
-        return exams
+            sql, args = sql + " WHERE faculty = ?", (faculty_username,)
+        with self._conn() as con:
+            rows = con.execute(sql + " ORDER BY created_at DESC, rowid", args).fetchall()
+            return [_exam(r) for r in rows]
 
     def update_exam(self, exam_id: str, updates: Dict[str, Any]) -> bool:
-        exams = self.load_exams()
-        if exam_id not in exams:
-            return False
-        exams[exam_id].update(updates)
-        self.save_exams(exams)
-        return True
+        unknown = set(updates) - _EXAM_UPDATABLE
+        if unknown:
+            raise ValueError(f"cannot update exam fields: {sorted(unknown)}")
+        if not updates:
+            return self.get_exam(exam_id) is not None
+        values = dict(updates)
+        if "questions" in values:
+            values["questions"] = _dump(values["questions"])
+        sets = ", ".join(f"{k} = ?" for k in values)
+        with self._conn() as con:
+            cur = con.execute(
+                f"UPDATE exams SET {sets} WHERE exam_id = ?", (*values.values(), exam_id)
+            )
+            return cur.rowcount > 0
 
     def delete_exam(self, exam_id: str) -> bool:
-        exams = self.load_exams()
-        if exam_id not in exams:
-            return False
-        exams.pop(exam_id)
-        self.save_exams(exams)
-        return True
+        with self._conn() as con:
+            return con.execute("DELETE FROM exams WHERE exam_id = ?", (exam_id,)).rowcount > 0
 
     # ── Exam submissions ────────────────────────────────────────────────────
-    def _load_subs(self) -> Dict[str, Dict]:
-        return _read_json(SUBMISSIONS_FILE, {})
-
     def save_exam_submission(
         self,
         username: str,
@@ -359,52 +541,49 @@ class DataManager:
         score: int = 0,
         integrity: Optional[Dict] = None,
     ) -> str:
-        subs = self._load_subs()
-        key = f"{username}::{exam_id}"
         avg_conf = (
             sum(a["confidence"] for a in auth_log) / len(auth_log)
             if auth_log
             else 0.0
         )
-        subs[key] = {
-            "username": username,
-            "exam_id": exam_id,
-            "session_id": session_id,
-            "answers": answers,
-            "score": score,
-            "integrity": integrity,
-            "avg_conf": avg_conf,
-            "cp_count": len(cp_log),
-            "timestamp": time.time(),
-        }
-        _write_json(SUBMISSIONS_FILE, subs)
-        return key
+        with self._conn() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO exam_submissions (username, exam_id, session_id,"
+                " answers, score, integrity, avg_conf, cp_count, timestamp)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (username, exam_id, session_id, _dump(answers), score, _dump(integrity),
+                 avg_conf, len(cp_log), time.time()),
+            )
+        return f"{username}::{exam_id}"
 
-    def get_exam_submission(
-        self, username: str, exam_id: str
-    ) -> Optional[Dict]:
-        return self._load_subs().get(f"{username}::{exam_id}")
+    def get_exam_submission(self, username: str, exam_id: str) -> Optional[Dict]:
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT * FROM exam_submissions WHERE username = ? AND exam_id = ?",
+                (username, exam_id),
+            ).fetchone()
+            return _exam_sub(row) if row else None
 
     def get_exam_submissions(
         self,
         exam_id: Optional[str] = None,
         username: Optional[str] = None,
     ) -> List[Dict]:
-        rows = list(self._load_subs().values())
+        where, args = [], []
         if exam_id:
-            rows = [r for r in rows if r["exam_id"] == exam_id]
+            where.append("exam_id = ?")
+            args.append(exam_id)
         if username:
-            rows = [r for r in rows if r["username"] == username]
-        rows.sort(key=lambda r: r.get("timestamp", 0), reverse=True)
-        return rows
+            where.append("username = ?")
+            args.append(username)
+        sql = "SELECT * FROM exam_submissions"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        with self._conn() as con:
+            rows = con.execute(sql + " ORDER BY timestamp DESC, rowid", args).fetchall()
+            return [_exam_sub(r) for r in rows]
 
     # ── Labs ────────────────────────────────────────────────────────────────
-    def load_labs(self) -> Dict[str, Dict]:
-        return _read_json(LABS_FILE, {})
-
-    def save_labs(self, labs: Dict[str, Dict]) -> None:
-        _write_json(LABS_FILE, labs)
-
     def create_lab(
         self,
         faculty_username: str,
@@ -414,7 +593,6 @@ class DataManager:
         description: str,
         problems: List[Dict],
     ) -> str:
-        labs = self.load_labs()
         lid = uuid.uuid4().hex[:8]
         prepared: List[Dict] = []
         for p in problems:
@@ -434,33 +612,29 @@ class DataManager:
                     ),
                 }
             )
-        labs[lid] = {
-            "lab_id": lid,
-            "faculty": faculty_username,
-            "title": title,
-            "course": course,
-            "deadline": deadline,
-            "description": description,
-            "problems": prepared,
-            "created_at": time.time(),
-        }
-        self.save_labs(labs)
+        with self._conn() as con:
+            con.execute(
+                "INSERT INTO labs (lab_id, faculty, title, course, deadline, description,"
+                " problems, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (lid, faculty_username, title, course, deadline, description,
+                 _dump(prepared), time.time()),
+            )
         return lid
 
     def get_lab(self, lab_id: str) -> Optional[Dict]:
-        return self.load_labs().get(lab_id)
+        with self._conn() as con:
+            row = con.execute("SELECT * FROM labs WHERE lab_id = ?", (lab_id,)).fetchone()
+            return _lab(row) if row else None
 
     def get_labs(self, faculty_username: Optional[str] = None) -> List[Dict]:
-        labs = list(self.load_labs().values())
+        sql, args = "SELECT * FROM labs", ()
         if faculty_username:
-            labs = [lab for lab in labs if lab.get("faculty") == faculty_username]
-        labs.sort(key=lambda lab: lab.get("created_at", 0), reverse=True)
-        return labs
+            sql, args = sql + " WHERE faculty = ?", (faculty_username,)
+        with self._conn() as con:
+            rows = con.execute(sql + " ORDER BY created_at DESC, rowid", args).fetchall()
+            return [_lab(r) for r in rows]
 
     # ── Lab submissions ─────────────────────────────────────────────────────
-    def _load_lab_subs(self) -> List[Dict]:
-        return _read_json(LAB_SUBMISSIONS_FILE, [])
-
     def save_lab_submission(
         self,
         username: str,
@@ -473,31 +647,21 @@ class DataManager:
         engine_used: str = "",
         compile_error: str = "",
     ) -> str:
-        subs = self._load_lab_subs()
-        attempts = sum(
-            1
-            for s in subs
-            if s["username"] == username and s["problem_id"] == problem_id
-        ) + 1
-        rec = {
-            "submission_id": uuid.uuid4().hex[:10],
-            "username": username,
-            "lab_id": lab_id,
-            "problem_id": problem_id,
-            "code": code,
-            "results": test_results,
-            "score": int(score),
-            "max_score": int(max_score),
-            "passed": sum(1 for r in test_results if r.get("status") == "pass"),
-            "total": len(test_results),
-            "compile_error": compile_error,
-            "engine_used": engine_used,
-            "attempts": attempts,
-            "timestamp": time.time(),
-        }
-        subs.append(rec)
-        _write_json(LAB_SUBMISSIONS_FILE, subs)
-        return rec["submission_id"]
+        sid = uuid.uuid4().hex[:10]
+        with self._conn() as con:
+            attempts = con.execute(
+                "SELECT COUNT(*) FROM lab_submissions WHERE username = ? AND problem_id = ?",
+                (username, problem_id),
+            ).fetchone()[0] + 1
+            con.execute(
+                "INSERT INTO lab_submissions (submission_id, username, lab_id, problem_id, code,"
+                " results, score, max_score, passed, total, compile_error, engine_used,"
+                " attempts, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (sid, username, lab_id, problem_id, code, _dump(test_results), int(score),
+                 int(max_score), sum(1 for r in test_results if r.get("status") == "pass"),
+                 len(test_results), compile_error, engine_used, attempts, time.time()),
+            )
+        return sid
 
     def get_lab_submissions(
         self,
@@ -505,15 +669,17 @@ class DataManager:
         username: Optional[str] = None,
         problem_id: Optional[str] = None,
     ) -> List[Dict]:
-        rows = self._load_lab_subs()
-        if lab_id:
-            rows = [r for r in rows if r["lab_id"] == lab_id]
-        if username:
-            rows = [r for r in rows if r["username"] == username]
-        if problem_id:
-            rows = [r for r in rows if r["problem_id"] == problem_id]
-        rows.sort(key=lambda r: r.get("timestamp", 0), reverse=True)
-        return rows
+        where, args = [], []
+        for col, val in (("lab_id", lab_id), ("username", username), ("problem_id", problem_id)):
+            if val:
+                where.append(f"{col} = ?")
+                args.append(val)
+        sql = "SELECT * FROM lab_submissions"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        with self._conn() as con:
+            rows = con.execute(sql + " ORDER BY timestamp DESC, rowid", args).fetchall()
+            return [_lab_sub(r) for r in rows]
 
     def get_best_lab_submission(
         self, username: str, problem_id: str
@@ -524,9 +690,6 @@ class DataManager:
         return max(rows, key=lambda r: r.get("score", 0))
 
     # ── Auth logs ───────────────────────────────────────────────────────────
-    def _load_auth(self) -> List[Dict]:
-        return _read_json(AUTH_LOG_FILE, [])
-
     def log_auth_check(
         self,
         username: str,
@@ -535,28 +698,30 @@ class DataManager:
         status: str,
         engine: str = "continuous",
     ) -> None:
-        rows = self._load_auth()
-        rows.append(
-            {
-                "username": username,
-                "session_id": session_id,
-                "confidence": float(confidence),
-                "status": status,
-                "engine": engine,
-                "timestamp": time.time(),
-            }
-        )
-        _write_json(AUTH_LOG_FILE, rows)
+        with self._conn() as con:
+            con.execute(
+                f"INSERT INTO auth_logs ({_AUTH_COLS}) VALUES (?, ?, ?, ?, ?, ?)",
+                (username, session_id, float(confidence), status, engine, time.time()),
+            )
 
     def get_auth_log(self, username: str, session_id: str) -> List[Dict]:
-        return [
-            r
-            for r in self._load_auth()
-            if r["username"] == username and r["session_id"] == session_id
-        ]
+        with self._conn() as con:
+            rows = con.execute(
+                f"SELECT {_AUTH_COLS} FROM auth_logs WHERE username = ? AND session_id = ?"
+                " ORDER BY id",
+                (username, session_id),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def get_student_auth_summary(self, username: str) -> Dict[str, Any]:
-        rows = [r for r in self._load_auth() if r["username"] == username]
+        with self._conn() as con:
+            rows = [
+                dict(r)
+                for r in con.execute(
+                    f"SELECT {_AUTH_COLS} FROM auth_logs WHERE username = ? ORDER BY id",
+                    (username,),
+                ).fetchall()
+            ]
         if not rows:
             return {
                 "avg_conf": 0.0,
@@ -629,68 +794,42 @@ class DataManager:
     def get_recent_submissions(
         self, faculty_username: str, limit: int = 5
     ) -> List[Dict]:
-        users = self.load_users()
-        out: List[Dict] = []
-        for s in self.get_exam_submissions():
-            exam = self.get_exam(s["exam_id"])
-            if not exam or exam.get("faculty") != faculty_username:
-                continue
-            student = users.get(s["username"], {})
-            out.append(
-                {
-                    "kind": f"exam: {exam['title']}",
-                    "username": s["username"],
-                    "student_name": student.get("full_name", s["username"]),
-                    "timestamp": s["timestamp"],
-                }
-            )
-        for s in self.get_lab_submissions():
-            lab = self.get_lab(s["lab_id"])
-            if not lab or lab.get("faculty") != faculty_username:
-                continue
-            student = users.get(s["username"], {})
-            out.append(
-                {
-                    "kind": f"lab: {lab['title']}",
-                    "username": s["username"],
-                    "student_name": student.get("full_name", s["username"]),
-                    "timestamp": s["timestamp"],
-                }
-            )
-        out.sort(key=lambda r: r["timestamp"], reverse=True)
-        return out[:limit]
+        sql = """
+            SELECT 'exam: ' || e.title AS kind, s.username AS username,
+                   COALESCE(u.full_name, s.username) AS student_name, s.timestamp AS timestamp
+            FROM exam_submissions s
+            JOIN exams e ON e.exam_id = s.exam_id AND e.faculty = ?
+            LEFT JOIN users u ON u.username = s.username
+            UNION ALL
+            SELECT 'lab: ' || l.title, s.username,
+                   COALESCE(u.full_name, s.username), s.timestamp
+            FROM lab_submissions s
+            JOIN labs l ON l.lab_id = s.lab_id AND l.faculty = ?
+            LEFT JOIN users u ON u.username = s.username
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """
+        with self._conn() as con:
+            rows = con.execute(sql, (faculty_username, faculty_username, int(limit))).fetchall()
+            return [dict(r) for r in rows]
 
     def get_flagged_recent(
         self, faculty_username: str, hours: int = 24
     ) -> List[Dict]:
-        users = self.load_users()
-        student_set = {
-            r["student"]
-            for r in self._load_enrollments()
-            if r["faculty"] == faculty_username
-        }
         cutoff = time.time() - hours * 3600
-        rows = []
-        for r in self._load_auth():
-            if (
-                r["username"] in student_set
-                and r["status"] == "Flagged"
-                and r["timestamp"] >= cutoff
-            ):
-                u = users.get(r["username"], {})
-                rows.append(
-                    {
-                        **r,
-                        "student_name": u.get("full_name", r["username"]),
-                    }
-                )
-        rows.sort(key=lambda r: r["timestamp"], reverse=True)
-        return rows
+        sql = """
+            SELECT a.username, a.session_id, a.confidence, a.status, a.engine, a.timestamp,
+                   COALESCE(u.full_name, a.username) AS student_name
+            FROM auth_logs a
+            JOIN enrollments e ON e.student = a.username AND e.faculty = ?
+            LEFT JOIN users u ON u.username = a.username
+            WHERE a.status = 'Flagged' AND a.timestamp >= ?
+            ORDER BY a.timestamp DESC
+        """
+        with self._conn() as con:
+            return [dict(r) for r in con.execute(sql, (faculty_username, cutoff)).fetchall()]
 
     # ── Copy-paste logs ─────────────────────────────────────────────────────
-    def _load_cp(self) -> List[Dict]:
-        return _read_json(CP_LOG_FILE, [])
-
     def log_cp_event(
         self,
         username: str,
@@ -699,25 +838,20 @@ class DataManager:
         question_id: str,
         chars: int,
     ) -> None:
-        rows = self._load_cp()
-        rows.append(
-            {
-                "username": username,
-                "session_id": session_id,
-                "event_type": event_type,
-                "question_id": question_id,
-                "chars": int(chars),
-                "timestamp": time.time(),
-            }
-        )
-        _write_json(CP_LOG_FILE, rows)
+        with self._conn() as con:
+            con.execute(
+                f"INSERT INTO cp_logs ({_CP_COLS}) VALUES (?, ?, ?, ?, ?, ?)",
+                (username, session_id, event_type, question_id, int(chars), time.time()),
+            )
 
     def get_cp_log(self, username: str, session_id: str) -> List[Dict]:
-        return [
-            r
-            for r in self._load_cp()
-            if r["username"] == username and r["session_id"] == session_id
-        ]
+        with self._conn() as con:
+            rows = con.execute(
+                f"SELECT {_CP_COLS} FROM cp_logs WHERE username = ? AND session_id = ?"
+                " ORDER BY id",
+                (username, session_id),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     # ── Integrity score ─────────────────────────────────────────────────────
     @staticmethod
@@ -741,3 +875,124 @@ class DataManager:
             "integrity_score": integrity_score,
             "grade": grade,
         }
+
+    # ── One-time import of the old JSON files ───────────────────────────────
+    def _auto_import_legacy_json(self) -> None:
+        """Import data/*.json once, if the database is still empty."""
+        with self._conn() as con:
+            done = con.execute(
+                "SELECT 1 FROM meta WHERE key = 'legacy_json_imported'"
+            ).fetchone()
+            empty = con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+        legacy_users = os.path.join(os.path.dirname(os.path.abspath(self.db_path)), "users.json")
+        if not done and empty and os.path.exists(legacy_users):
+            self.import_json(os.path.dirname(legacy_users))
+
+    def import_json(self, data_dir: str) -> Dict[str, int]:
+        """Copy the old JSON files from `data_dir` into the database.
+
+        Returns how many rows were imported per table. Rows that point to a
+        user that does not exist are skipped. The JSON files are not changed.
+        """
+        rd = lambda name, default: _read_legacy_json(os.path.join(data_dir, name), default)
+        users = rd("users.json", {})
+        enrollments = rd("enrollments.json", [])
+        exams = rd("exams.json", {})
+        labs = rd("labs.json", {})
+        subs = rd("submissions.json", {})
+        lab_subs = rd("lab_submissions.json", [])
+        auth = rd("auth_logs.json", [])
+        cp = rd("cp_logs.json", [])
+
+        n = {k: 0 for k in (
+            "users", "samples", "enrollments", "exams", "exam_submissions",
+            "labs", "lab_submissions", "auth_logs", "cp_logs")}
+        now = time.time()
+        with self._conn() as con:
+            for name, u in users.items():
+                con.execute(
+                    "INSERT OR IGNORE INTO users (username, password_hash, full_name, role,"
+                    " course_name, enrollment_no, created_at, enrolled) VALUES (?,?,?,?,?,?,?,?)",
+                    (u.get("username", name), u.get("password_hash", ""), u.get("full_name", ""),
+                     u.get("role", "student"), u.get("course_name"), u.get("enrollment_no"),
+                     u.get("created_at", now), int(bool(u.get("enrolled")))),
+                )
+                n["users"] += 1
+                for feats in u.get("samples", []):
+                    con.execute(
+                        "INSERT INTO samples (username, features) VALUES (?, ?)",
+                        (u.get("username", name), _dump(feats)),
+                    )
+                    n["samples"] += 1
+            known = {r[0] for r in con.execute("SELECT username FROM users")}
+            for r in enrollments:
+                if r.get("student") in known and r.get("faculty") in known:
+                    con.execute(
+                        "INSERT OR IGNORE INTO enrollments (student, faculty, since) VALUES (?,?,?)",
+                        (r["student"], r["faculty"], r.get("since", now)),
+                    )
+                    n["enrollments"] += 1
+            for eid, e in exams.items():
+                con.execute(
+                    "INSERT OR IGNORE INTO exams (exam_id, faculty, title, subject, date,"
+                    " start_time, duration_mins, instructions, questions, status, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (e.get("exam_id", eid), e.get("faculty", ""), e.get("title", ""),
+                     e.get("subject"), e.get("date"), e.get("start_time", "10:00"),
+                     int(e.get("duration_mins", 0)), e.get("instructions"),
+                     _dump(e.get("questions", [])), e.get("status", "upcoming"),
+                     e.get("created_at", now)),
+                )
+                n["exams"] += 1
+            for lid, lab in labs.items():
+                con.execute(
+                    "INSERT OR IGNORE INTO labs (lab_id, faculty, title, course, deadline,"
+                    " description, problems, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (lab.get("lab_id", lid), lab.get("faculty", ""), lab.get("title", ""),
+                     lab.get("course"), lab.get("deadline"), lab.get("description"),
+                     _dump(lab.get("problems", [])), lab.get("created_at", now)),
+                )
+                n["labs"] += 1
+            for s in subs.values():
+                con.execute(
+                    "INSERT OR REPLACE INTO exam_submissions (username, exam_id, session_id,"
+                    " answers, score, integrity, avg_conf, cp_count, timestamp)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (s["username"], s["exam_id"], s.get("session_id", ""),
+                     _dump(s.get("answers", {})), int(s.get("score", 0)),
+                     _dump(s.get("integrity")), float(s.get("avg_conf", 0.0)),
+                     int(s.get("cp_count", 0)), s.get("timestamp", now)),
+                )
+                n["exam_submissions"] += 1
+            for s in lab_subs:
+                con.execute(
+                    "INSERT OR IGNORE INTO lab_submissions (submission_id, username, lab_id,"
+                    " problem_id, code, results, score, max_score, passed, total, compile_error,"
+                    " engine_used, attempts, timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (s.get("submission_id") or uuid.uuid4().hex[:10], s["username"], s["lab_id"],
+                     s["problem_id"], s.get("code", ""), _dump(s.get("results", [])),
+                     int(s.get("score", 0)), int(s.get("max_score", 0)),
+                     int(s.get("passed", 0)), int(s.get("total", 0)),
+                     s.get("compile_error", ""), s.get("engine_used", ""),
+                     int(s.get("attempts", 1)), s.get("timestamp", now)),
+                )
+                n["lab_submissions"] += 1
+            for r in auth:
+                con.execute(
+                    f"INSERT INTO auth_logs ({_AUTH_COLS}) VALUES (?,?,?,?,?,?)",
+                    (r["username"], r["session_id"], float(r["confidence"]), r["status"],
+                     r.get("engine", "continuous"), r.get("timestamp", now)),
+                )
+                n["auth_logs"] += 1
+            for r in cp:
+                con.execute(
+                    f"INSERT INTO cp_logs ({_CP_COLS}) VALUES (?,?,?,?,?,?)",
+                    (r["username"], r["session_id"], r.get("event_type", ""),
+                     r.get("question_id", ""), int(r.get("chars", 0)), r.get("timestamp", now)),
+                )
+                n["cp_logs"] += 1
+            con.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_json_imported', ?)",
+                (_dump(n),),
+            )
+        return n

@@ -17,3 +17,7 @@ experiments/data/*.txt
 
 # Jupyter
 .ipynb_checkpoints/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm

@@ -2,7 +2,7 @@
 
 TrueTestAuth is a Streamlit-based assessment platform that combines **behavioral keystroke authentication**, **continuous identity verification**, **proctored exams**, and an **auto-graded C++ coding-lab environment** for faculty and students.
 
-The application provides separate faculty and student workflows, stores application data in local JSON files, uses a TensorFlow/Keras LSTM model for behavioral authentication, and supports multiple C++ execution backends.
+The application provides separate faculty and student workflows, stores application data in a local SQLite database, uses a TensorFlow/Keras LSTM model for behavioral authentication, and supports multiple C++ execution backends.
 
 ---
 
@@ -21,7 +21,7 @@ The current implementation includes:
 - Automatic coding-test evaluation and submission history
 - Faculty dashboards and behavioral/integrity reports
 - PDF question-paper text extraction using `pdfplumber`
-- Local JSON persistence
+- Local SQLite persistence
 - TensorFlow/Keras LSTM model persistence
 
 ---
@@ -156,7 +156,7 @@ The reporting workflow displays behavioral-authentication and academic informati
 
 ### Persistence
 
-- Local JSON files
+- Local SQLite database (`data/truetestauth.db`)
 
 ---
 
@@ -174,7 +174,7 @@ flowchart TD
     P[Piston API]
     J0[Judge0 API]
     MD[models/behavioral_auth_model_lstm]
-    DB[data/*.json]
+    DB[data/truetestauth.db]
     L[Authentication / Integrity Logs]
 
     B --> A
@@ -205,7 +205,7 @@ Main Streamlit entry point and application workflow controller. It handles authe
 
 ### `data_manager.py`
 
-JSON-backed persistence layer for users, enrollments, exams, labs, submissions, authentication logs, and copy/paste logs.
+SQLite-backed persistence layer (Python's built-in `sqlite3`) for users, keystroke samples, enrollments, exams, labs, submissions, authentication logs, and copy/paste logs.
 
 ### `ml_model.py`
 
@@ -244,10 +244,7 @@ TrueTestAuth/
 │       ├── lstm_model.keras
 │       └── metadata.json
 ├── data/
-│   ├── enrollments.json
-│   ├── exams.json
-│   ├── labs.json
-│   └── users.json
+│   └── truetestauth.db        (created on first run)
 ├── .env.example
 ├── .gitignore
 ├── app.py
@@ -261,17 +258,7 @@ TrueTestAuth/
 └── README.md
 ```
 
-Runtime activity can additionally create JSON files such as:
-
-```text
-data/
-├── submissions.json
-├── lab_submissions.json
-├── auth_logs.json
-└── cp_logs.json
-```
-
-These files are ignored by `.gitignore` through the `data/*.json` rule.
+The database file is ignored by `.gitignore` (`data/*.db*`), so a fresh clone creates an empty one on first run.
 
 ---
 
@@ -289,7 +276,7 @@ Faculty / Student
  Authentication        Assessment Workflow
         |                    |
         v                    +-------------------+
-   User JSON               |                   |
+   User table              |                   |
                            v                   v
                          Exams               C++ Labs
                            |                   |
@@ -302,7 +289,7 @@ Faculty / Student
                            +---------+---------+
                                      |
                                      v
-                              JSON Persistence
+                             SQLite Database
                                      |
                                      v
                                Faculty Reports
@@ -583,46 +570,24 @@ These are application events, not public HTTP API endpoints.
 
 ## Data Storage
 
-The project uses local JSON files as its persistence layer.
+The project stores everything in one SQLite file, `data/truetestauth.db`. It uses Python's built-in `sqlite3`, so there is no database server and no extra package to install. `DataManager` in `data_manager.py` is the only code that talks to it.
 
-### `data/users.json`
+| Table | What it stores |
+| --- | --- |
+| `users` | Username (primary key), password hash, full name, role, course name, enrollment number, creation time, enrolled flag |
+| `samples` | One row per keystroke-feature sample of a student (features as a JSON list) |
+| `enrollments` | Which student is in which faculty's course |
+| `exams` | Exam metadata, timing, status, and the questions (JSON) |
+| `exam_submissions` | One row per student and exam: answers, score, integrity result, average confidence, paste count |
+| `labs` | Lab metadata and problem definitions (JSON): statements, limits, sample and hidden tests, starter code, points |
+| `lab_submissions` | Every lab attempt with code, per-test results, score, and attempt number |
+| `auth_logs` | Behavioural-authentication confidence timeline per session |
+| `cp_logs` | Copy/paste events per session |
 
-Stores account information including:
-
-- Username
-- Password hash
-- Full name
-- Role
-- Course name where applicable
-- Enrollment number where applicable
-- Creation timestamp
-- Behavioral samples
-- Enrollment state
-
-### `data/enrollments.json`
-
-Stores student-to-faculty enrollment relationships.
-
-### `data/exams.json`
-
-Stores exam metadata, timing, questions, MCQ options/correct answers, marks, and status.
-
-### `data/labs.json`
-
-Stores coding-lab metadata and problem definitions, including statements, limits, sample tests, hidden tests, starter code, and total points.
-
-### Runtime Files
-
-The application can create:
-
-```text
-data/submissions.json
-data/lab_submissions.json
-data/auth_logs.json
-data/cp_logs.json
-```
-
-These store exam submissions, lab submissions, authentication records, and copy/paste event records.
+- Each call opens its own short connection, so many Streamlit sessions can read and write at the same time. Writes are transactions (all or nothing).
+- Passwords are stored as salted PBKDF2 hashes. All queries use bound parameters, never string-built SQL.
+- **Migration from the old JSON files:** if the database is empty and the old `data/*.json` files exist, they are imported once automatically on start-up. The JSON files are not changed or deleted, and you can delete them once you are happy.
+- To look at the data: `sqlite3 data/truetestauth.db` or any SQLite viewer (for example *DB Browser for SQLite* or the VS Code *SQLite Viewer* extension).
 
 ---
 
@@ -903,9 +868,9 @@ The uploaded implementation is an academic/demo application and should be harden
 
 `data_manager.py` hashes passwords with salted PBKDF2-HMAC-SHA256 (200,000 iterations). Legacy unsalted SHA-256 hashes are still accepted and are upgraded automatically on the user's next successful login.
 
-### JSON Persistence
+### SQLite Persistence
 
-Application state is stored in local JSON files. This is simple for a demo but does not provide the database transaction, concurrency, access-control, and auditing features normally required in production.
+Application state is stored in a local SQLite file. It gives transactions and safe concurrent access from one machine, but there is no per-user database access control, auditing, or replication. For many users on several servers, move to PostgreSQL or MySQL (the `DataManager` methods are the only place that would change).
 
 ### Client-Side Restrictions
 
@@ -926,13 +891,13 @@ The current repository has the following implementation limitations:
 - No independent held-out benchmark dataset is included.
 - No persisted model evaluation report is included.
 - Verification uses aggregate timing features, so two users with almost identical typing speed and rhythm (within roughly 7-10 %) cannot be told apart; thresholds and tolerances are heuristics that have not been calibrated on real keystroke data.
-- Application persistence uses local JSON files.
+- Application persistence uses a single local SQLite file (one machine only; no replication or per-user access control).
 - No public REST API is implemented.
 - Browser-side clipboard blocking is not a complete anti-cheating mechanism.
 - The local C++ execution backend is not a production sandbox.
 - Problem memory limits are enforced via `RLIMIT_AS` only on Linux/macOS (with a 128 MB floor); they are not enforced on Windows or by the Piston/Judge0 backends.
 - No automated unit/integration test suite is included.
-- `.gitignore` ignores the runtime JSON and LSTM model directories/files, so a fresh clone should regenerate demo runtime assets with `seed_demo.py`.
+- `.gitignore` ignores the runtime database and LSTM model directories/files, so a fresh clone should regenerate demo runtime assets with `seed_demo.py`.
 
 ---
 
@@ -940,7 +905,7 @@ The current repository has the following implementation limitations:
 
 Potential improvements consistent with the current architecture include:
 
-- Replace JSON persistence with a production database.
+- Move from SQLite to a server database (such as PostgreSQL) if the app must run on several servers.
 - Add hardened sandboxing for C++ execution.
 - Enforce CPU, memory, filesystem, and network limits during code execution.
 - Add a real keystroke-dynamics dataset and independent evaluation split.
@@ -990,7 +955,7 @@ Additional history can be viewed through the repository's Git log.
 | --- | --- |
 | `app.py` | Main Streamlit application and workflow controller |
 | `compiler.py` | C++ compilation, execution backends, result handling, and grading |
-| `data_manager.py` | JSON persistence and data operations |
+| `data_manager.py` | SQLite persistence and data operations |
 | `ml_model.py` | Keystroke feature extraction and LSTM behavioral authentication |
 | `seed_demo.py` | Demo data, model training, exam, and coding-lab seeding |
 | `ui_components.py` | Reusable interface components and layouts |
@@ -1016,7 +981,7 @@ The current codebase provides an academic/demo assessment platform with:
 - Descriptive-answer storage
 - C++ coding labs
 - Hidden-test auto-grading
-- Local JSON persistence
+- Local SQLite persistence
 - Faculty reports
 - Clipboard-event logging
 - TensorFlow/Keras LSTM authentication
