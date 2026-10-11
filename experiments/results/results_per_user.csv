@@ -1,0 +1,358 @@
+method,user,EER,FRR at FAR 1%
+Euclidean,s002,0.26,0.995
+Euclidean,s003,0.189,0.985
+Euclidean,s004,0.189,0.99
+Euclidean,s005,0.1155,0.645
+Euclidean,s007,0.07100000000000001,0.92
+Euclidean,s008,0.109,0.95
+Euclidean,s010,0.04,0.065
+Euclidean,s011,0.08,0.85
+Euclidean,s012,0.12,0.805
+Euclidean,s013,0.1445,0.845
+Euclidean,s015,0.2,0.98
+Euclidean,s016,0.269,0.795
+Euclidean,s017,0.0845,0.425
+Euclidean,s018,0.1755,0.94
+Euclidean,s019,0.0755,0.75
+Euclidean,s020,0.2045,0.98
+Euclidean,s021,0.1555,0.415
+Euclidean,s022,0.4155,0.975
+Euclidean,s024,0.1955,0.925
+Euclidean,s025,0.16,0.68
+Euclidean,s026,0.1355,0.445
+Euclidean,s027,0.18,0.9
+Euclidean,s028,0.1845,0.69
+Euclidean,s029,0.12,0.875
+Euclidean,s030,0.17099999999999999,0.66
+Euclidean,s031,0.311,0.965
+Euclidean,s032,0.2,0.98
+Euclidean,s033,0.3355,0.905
+Euclidean,s034,0.2445,1.0
+Euclidean,s035,0.231,0.98
+Euclidean,s036,0.0555,0.32
+Euclidean,s037,0.17099999999999999,0.96
+Euclidean,s038,0.149,0.555
+Euclidean,s039,0.149,0.805
+Euclidean,s040,0.4045,0.985
+Euclidean,s041,0.189,0.755
+Euclidean,s042,0.08,0.27
+Euclidean,s043,0.1445,0.86
+Euclidean,s044,0.1645,0.815
+Euclidean,s046,0.149,0.73
+Euclidean,s047,0.28,0.995
+Euclidean,s048,0.12,0.765
+Euclidean,s049,0.4845,0.995
+Euclidean,s050,0.1845,0.865
+Euclidean,s051,0.089,0.89
+Euclidean,s052,0.07100000000000001,0.07
+Euclidean,s053,0.1045,0.19
+Euclidean,s054,0.0955,0.41
+Euclidean,s055,0.02,0.045
+Euclidean,s056,0.1245,0.98
+Euclidean,s057,0.1,0.98
+Manhattan,s002,0.24,0.98
+Manhattan,s003,0.191,0.975
+Manhattan,s004,0.1445,0.985
+Manhattan,s005,0.091,0.635
+Manhattan,s007,0.089,0.925
+Manhattan,s008,0.109,0.89
+Manhattan,s010,0.0245,0.06
+Manhattan,s011,0.0845,0.805
+Manhattan,s012,0.08,0.575
+Manhattan,s013,0.1045,0.725
+Manhattan,s015,0.1845,0.995
+Manhattan,s016,0.2955,0.705
+Manhattan,s017,0.06,0.17
+Manhattan,s018,0.17099999999999999,0.87
+Manhattan,s019,0.0755,0.41
+Manhattan,s020,0.2555,0.955
+Manhattan,s021,0.129,0.49
+Manhattan,s022,0.22,0.85
+Manhattan,s024,0.1445,0.84
+Manhattan,s025,0.111,0.39
+Manhattan,s026,0.111,0.49
+Manhattan,s027,0.1645,0.77
+Manhattan,s028,0.1355,0.665
+Manhattan,s029,0.0955,0.415
+Manhattan,s030,0.14,0.495
+Manhattan,s031,0.3155,0.935
+Manhattan,s032,0.231,0.975
+Manhattan,s033,0.269,0.805
+Manhattan,s034,0.229,1.0
+Manhattan,s035,0.249,0.975
+Manhattan,s036,0.035500000000000004,0.11
+Manhattan,s037,0.1445,0.92
+Manhattan,s038,0.129,0.54
+Manhattan,s039,0.14,0.755
+Manhattan,s040,0.349,0.98
+Manhattan,s041,0.17099999999999999,0.72
+Manhattan,s042,0.0555,0.18
+Manhattan,s043,0.0845,0.485
+Manhattan,s044,0.131,0.645
+Manhattan,s046,0.189,0.715
+Manhattan,s047,0.331,1.0
+Manhattan,s048,0.0955,0.68
+Manhattan,s049,0.48,0.995
+Manhattan,s050,0.1645,0.84
+Manhattan,s051,0.1,0.88
+Manhattan,s052,0.0445,0.08
+Manhattan,s053,0.0555,0.145
+Manhattan,s054,0.1,0.56
+Manhattan,s055,0.011,0.04
+Manhattan,s056,0.111,0.995
+Manhattan,s057,0.129,0.95
+Scaled Manhattan,s002,0.24,0.705
+Scaled Manhattan,s003,0.14,0.835
+Scaled Manhattan,s004,0.08,0.545
+Scaled Manhattan,s005,0.0445,0.075
+Scaled Manhattan,s007,0.111,0.91
+Scaled Manhattan,s008,0.0645,0.4
+Scaled Manhattan,s010,0.0245,0.045
+Scaled Manhattan,s011,0.07100000000000001,0.43
+Scaled Manhattan,s012,0.02,0.165
+Scaled Manhattan,s013,0.07100000000000001,0.45
+Scaled Manhattan,s015,0.109,0.995
+Scaled Manhattan,s016,0.18,0.64
+Scaled Manhattan,s017,0.028999999999999998,0.065
+Scaled Manhattan,s018,0.1245,0.635
+Scaled Manhattan,s019,0.0445,0.06
+Scaled Manhattan,s020,0.14,0.63
+Scaled Manhattan,s021,0.1155,0.54
+Scaled Manhattan,s022,0.028999999999999998,0.03
+Scaled Manhattan,s024,0.051000000000000004,0.17
+Scaled Manhattan,s025,0.0755,0.27
+Scaled Manhattan,s026,0.0445,0.135
+Scaled Manhattan,s027,0.07100000000000001,0.29
+Scaled Manhattan,s028,0.06,0.325
+Scaled Manhattan,s029,0.07100000000000001,0.21
+Scaled Manhattan,s030,0.08,0.36
+Scaled Manhattan,s031,0.2755,0.8
+Scaled Manhattan,s032,0.271,0.95
+Scaled Manhattan,s033,0.109,0.45
+Scaled Manhattan,s034,0.1445,0.945
+Scaled Manhattan,s035,0.1955,0.675
+Scaled Manhattan,s036,0.009000000000000001,0.01
+Scaled Manhattan,s037,0.109,0.565
+Scaled Manhattan,s038,0.089,0.28
+Scaled Manhattan,s039,0.0845,0.125
+Scaled Manhattan,s040,0.1555,0.63
+Scaled Manhattan,s041,0.1,0.21
+Scaled Manhattan,s042,0.0445,0.065
+Scaled Manhattan,s043,0.0155,0.015
+Scaled Manhattan,s044,0.0755,0.205
+Scaled Manhattan,s046,0.1445,0.56
+Scaled Manhattan,s047,0.3245,0.98
+Scaled Manhattan,s048,0.0645,0.48
+Scaled Manhattan,s049,0.0645,0.635
+Scaled Manhattan,s050,0.109,0.48
+Scaled Manhattan,s051,0.0955,0.835
+Scaled Manhattan,s052,0.0155,0.02
+Scaled Manhattan,s053,0.028999999999999998,0.04
+Scaled Manhattan,s054,0.069,0.655
+Scaled Manhattan,s055,0.0155,0.015
+Scaled Manhattan,s056,0.08,0.785
+Scaled Manhattan,s057,0.1155,0.765
+Z-score distance,s002,0.2445,0.695
+Z-score distance,s003,0.149,0.865
+Z-score distance,s004,0.089,0.48
+Z-score distance,s005,0.0445,0.065
+Z-score distance,s007,0.109,0.845
+Z-score distance,s008,0.0645,0.39
+Z-score distance,s010,0.028999999999999998,0.035
+Z-score distance,s011,0.069,0.375
+Z-score distance,s012,0.0155,0.16
+Z-score distance,s013,0.0755,0.435
+Z-score distance,s015,0.1155,0.985
+Z-score distance,s016,0.1555,0.655
+Z-score distance,s017,0.0245,0.06
+Z-score distance,s018,0.1155,0.62
+Z-score distance,s019,0.04,0.06
+Z-score distance,s020,0.1355,0.57
+Z-score distance,s021,0.1045,0.6
+Z-score distance,s022,0.0245,0.035
+Z-score distance,s024,0.0445,0.175
+Z-score distance,s025,0.0755,0.21
+Z-score distance,s026,0.0445,0.115
+Z-score distance,s027,0.0645,0.295
+Z-score distance,s028,0.035500000000000004,0.38
+Z-score distance,s029,0.069,0.195
+Z-score distance,s030,0.089,0.355
+Z-score distance,s031,0.289,0.82
+Z-score distance,s032,0.2845,0.955
+Z-score distance,s033,0.0955,0.49
+Z-score distance,s034,0.1645,0.92
+Z-score distance,s035,0.1845,0.635
+Z-score distance,s036,0.0,0.0
+Z-score distance,s037,0.1045,0.51
+Z-score distance,s038,0.08,0.255
+Z-score distance,s039,0.08,0.115
+Z-score distance,s040,0.1445,0.645
+Z-score distance,s041,0.089,0.23
+Z-score distance,s042,0.049,0.07
+Z-score distance,s043,0.011,0.015
+Z-score distance,s044,0.0645,0.215
+Z-score distance,s046,0.1445,0.515
+Z-score distance,s047,0.3045,0.98
+Z-score distance,s048,0.06,0.545
+Z-score distance,s049,0.06,0.46
+Z-score distance,s050,0.109,0.44
+Z-score distance,s051,0.0955,0.805
+Z-score distance,s052,0.0155,0.015
+Z-score distance,s053,0.028999999999999998,0.065
+Z-score distance,s054,0.0555,0.655
+Z-score distance,s055,0.011,0.015
+Z-score distance,s056,0.0845,0.74
+Z-score distance,s057,0.109,0.675
+Mahalanobis,s002,0.2645,0.525
+Mahalanobis,s003,0.22,0.66
+Mahalanobis,s004,0.091,0.245
+Mahalanobis,s005,0.07100000000000001,0.115
+Mahalanobis,s007,0.089,0.42
+Mahalanobis,s008,0.0755,0.23
+Mahalanobis,s010,0.051000000000000004,0.155
+Mahalanobis,s011,0.0955,0.225
+Mahalanobis,s012,0.08,0.415
+Mahalanobis,s013,0.1045,0.405
+Mahalanobis,s015,0.1245,0.705
+Mahalanobis,s016,0.1445,0.68
+Mahalanobis,s017,0.031,0.095
+Mahalanobis,s018,0.1555,0.575
+Mahalanobis,s019,0.07100000000000001,0.16
+Mahalanobis,s020,0.149,0.5
+Mahalanobis,s021,0.1355,0.445
+Mahalanobis,s022,0.035500000000000004,0.05
+Mahalanobis,s024,0.035500000000000004,0.145
+Mahalanobis,s025,0.111,0.195
+Mahalanobis,s026,0.0555,0.16
+Mahalanobis,s027,0.08,0.2
+Mahalanobis,s028,0.0445,0.18
+Mahalanobis,s029,0.0845,0.245
+Mahalanobis,s030,0.16,0.52
+Mahalanobis,s031,0.229,0.74
+Mahalanobis,s032,0.2845,0.83
+Mahalanobis,s033,0.1245,0.31
+Mahalanobis,s034,0.1845,0.58
+Mahalanobis,s035,0.1555,0.585
+Mahalanobis,s036,0.009000000000000001,0.01
+Mahalanobis,s037,0.1155,0.445
+Mahalanobis,s038,0.1045,0.255
+Mahalanobis,s039,0.0845,0.1
+Mahalanobis,s040,0.2,0.45
+Mahalanobis,s041,0.12,0.28
+Mahalanobis,s042,0.07100000000000001,0.1
+Mahalanobis,s043,0.0245,0.03
+Mahalanobis,s044,0.08,0.26
+Mahalanobis,s046,0.1445,0.33
+Mahalanobis,s047,0.269,0.905
+Mahalanobis,s048,0.0845,0.42
+Mahalanobis,s049,0.1,0.15
+Mahalanobis,s050,0.129,0.37
+Mahalanobis,s051,0.12,0.61
+Mahalanobis,s052,0.031,0.04
+Mahalanobis,s053,0.035500000000000004,0.07
+Mahalanobis,s054,0.0845,0.715
+Mahalanobis,s055,0.028999999999999998,0.05
+Mahalanobis,s056,0.1245,0.525
+Mahalanobis,s057,0.111,0.615
+TrueTestAuth profile,s002,0.2755,0.62
+TrueTestAuth profile,s003,0.17099999999999999,0.825
+TrueTestAuth profile,s004,0.0955,0.385
+TrueTestAuth profile,s005,0.0555,0.085
+TrueTestAuth profile,s007,0.109,0.68
+TrueTestAuth profile,s008,0.069,0.32
+TrueTestAuth profile,s010,0.0445,0.085
+TrueTestAuth profile,s011,0.0755,0.275
+TrueTestAuth profile,s012,0.0245,0.135
+TrueTestAuth profile,s013,0.0955,0.32
+TrueTestAuth profile,s015,0.129,0.84
+TrueTestAuth profile,s016,0.14,0.7
+TrueTestAuth profile,s017,0.028999999999999998,0.08
+TrueTestAuth profile,s018,0.14,0.425
+TrueTestAuth profile,s019,0.06,0.09
+TrueTestAuth profile,s020,0.1045,0.425
+TrueTestAuth profile,s021,0.131,0.465
+TrueTestAuth profile,s022,0.0445,0.065
+TrueTestAuth profile,s024,0.04,0.18
+TrueTestAuth profile,s025,0.109,0.235
+TrueTestAuth profile,s026,0.06,0.14
+TrueTestAuth profile,s027,0.091,0.215
+TrueTestAuth profile,s028,0.0555,0.415
+TrueTestAuth profile,s029,0.0955,0.195
+TrueTestAuth profile,s030,0.131,0.505
+TrueTestAuth profile,s031,0.269,0.765
+TrueTestAuth profile,s032,0.2955,0.92
+TrueTestAuth profile,s033,0.1155,0.46
+TrueTestAuth profile,s034,0.17099999999999999,0.83
+TrueTestAuth profile,s035,0.1645,0.545
+TrueTestAuth profile,s036,0.009000000000000001,0.01
+TrueTestAuth profile,s037,0.1045,0.48
+TrueTestAuth profile,s038,0.109,0.27
+TrueTestAuth profile,s039,0.089,0.115
+TrueTestAuth profile,s040,0.16,0.43
+TrueTestAuth profile,s041,0.12,0.245
+TrueTestAuth profile,s042,0.0645,0.085
+TrueTestAuth profile,s043,0.028999999999999998,0.06
+TrueTestAuth profile,s044,0.0755,0.375
+TrueTestAuth profile,s046,0.14,0.415
+TrueTestAuth profile,s047,0.309,0.975
+TrueTestAuth profile,s048,0.0755,0.4
+TrueTestAuth profile,s049,0.08,0.135
+TrueTestAuth profile,s050,0.1245,0.41
+TrueTestAuth profile,s051,0.0955,0.685
+TrueTestAuth profile,s052,0.0245,0.025
+TrueTestAuth profile,s053,0.04,0.085
+TrueTestAuth profile,s054,0.069,0.6
+TrueTestAuth profile,s055,0.0245,0.035
+TrueTestAuth profile,s056,0.091,0.725
+TrueTestAuth profile,s057,0.1,0.515
+One-class SVM,s002,0.269,0.845
+One-class SVM,s003,0.209,0.925
+One-class SVM,s004,0.0845,0.2
+One-class SVM,s005,0.051000000000000004,0.155
+One-class SVM,s007,0.1355,0.835
+One-class SVM,s008,0.069,0.795
+One-class SVM,s010,0.051000000000000004,0.215
+One-class SVM,s011,0.109,0.61
+One-class SVM,s012,0.035500000000000004,0.34
+One-class SVM,s013,0.1,0.675
+One-class SVM,s015,0.16,0.98
+One-class SVM,s016,0.1355,0.66
+One-class SVM,s017,0.02,0.085
+One-class SVM,s018,0.16,0.775
+One-class SVM,s019,0.035500000000000004,0.085
+One-class SVM,s020,0.12,0.785
+One-class SVM,s021,0.149,0.77
+One-class SVM,s022,0.028999999999999998,0.035
+One-class SVM,s024,0.035500000000000004,0.145
+One-class SVM,s025,0.0845,0.195
+One-class SVM,s026,0.051000000000000004,0.175
+One-class SVM,s027,0.07100000000000001,0.21
+One-class SVM,s028,0.028999999999999998,0.385
+One-class SVM,s029,0.08,0.25
+One-class SVM,s030,0.14,0.535
+One-class SVM,s031,0.2755,0.9
+One-class SVM,s032,0.309,0.93
+One-class SVM,s033,0.1,0.48
+One-class SVM,s034,0.189,0.935
+One-class SVM,s035,0.14,0.725
+One-class SVM,s036,0.009000000000000001,0.005
+One-class SVM,s037,0.1445,0.725
+One-class SVM,s038,0.12,0.52
+One-class SVM,s039,0.089,0.135
+One-class SVM,s040,0.1245,0.555
+One-class SVM,s041,0.12,0.475
+One-class SVM,s042,0.0645,0.07
+One-class SVM,s043,0.0155,0.015
+One-class SVM,s044,0.06,0.255
+One-class SVM,s046,0.149,0.71
+One-class SVM,s047,0.2955,0.97
+One-class SVM,s048,0.069,0.395
+One-class SVM,s049,0.0845,0.19
+One-class SVM,s050,0.1245,0.425
+One-class SVM,s051,0.1155,0.785
+One-class SVM,s052,0.0155,0.03
+One-class SVM,s053,0.04,0.09
+One-class SVM,s054,0.089,0.905
+One-class SVM,s055,0.0155,0.065
+One-class SVM,s056,0.131,0.96
+One-class SVM,s057,0.14,0.955

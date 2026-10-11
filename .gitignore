@@ -10,3 +10,10 @@ models/*.pkl
 models/*_lstm/
 models/*.keras
 .qodo/
+# Experiments: raw datasets are large / licensed, keep them local
+experiments/data/*.csv
+experiments/data/*.zip
+experiments/data/*.txt
+
+# Jupyter
+.ipynb_checkpoints/

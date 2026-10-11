@@ -1,0 +1,8 @@
+method,average EER (%),FRR when FAR is 1% (%)
+Z-score distance,9.31,42.04
+Scaled Manhattan,9.6,43.31
+TrueTestAuth profile,10.44,37.84
+One-class SVM,10.67,48.76
+Mahalanobis,11.0,35.34
+Manhattan,15.29,68.57
+Euclidean,17.05,75.6
