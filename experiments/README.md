@@ -23,8 +23,10 @@ Expected MD5: `470235f96568f28f9ea0da62234ec857`.
 pip install -r experiments/requirements.txt
 ```
 
+Part 3 also needs PyTorch (`pip install torch`; the CPU build is enough).
+
 Open `experiments/keystroke_verification.ipynb` in VS Code (choose the project's
-`.venv` as the kernel) or in Jupyter and press **Run All** (about 15 seconds).
+`.venv` as the kernel) or in Jupyter and press **Run All** (about 2.5 minutes, mostly training the networks).
 The notebook already contains its saved outputs, so you can also just read it.
 
 It writes `results/results_summary.csv`, `results/results_per_user.csv` and
@@ -36,7 +38,8 @@ It writes `results/results_summary.csv`, `results/results_per_user.csv` and
 |---|---|
 | Part 1 (steps 1-10) | the idea with **one user**: profile, distance, threshold, FAR / FRR, EER |
 | Part 2 (steps 11-14) | a fair test on **all 51 users**, comparing 7 methods |
-| Part 3 | results, limits, next steps |
+| Part 3 (steps 15-21) | a **Siamese network** (needs `torch`), tested fairly against the 7 methods |
+| Part 4 | results, limits, next steps |
 
 **Protocol** (same as the CMU paper), per user: train on their first 200 attempts;
 test on their last 200 (genuine) and on the first 5 attempts of each of the other
@@ -61,6 +64,29 @@ Scaled Manhattan, Mahalanobis, Manhattan and Euclidean are very close to the
 figures in the CMU paper, which suggests the data loading, protocol and metrics
 are correct.
 
+### Siamese network (Part 3)
+
+A neural network has to be tested on people it never saw, so Part 3 uses a
+different split: 5 groups of users, train on 4 groups, test on the 5th (owner and
+impostors both from the held-out group). All 8 methods use the same test, so the
+numbers are **not comparable with the table above**.
+
+| Method | EER | FRR at FAR 1 % |
+|---|---|---|
+| Z-score distance | 12.51 % | 45.55 % |
+| Scaled Manhattan | 12.94 % | 46.92 % |
+| TrueTestAuth profile | 13.27 % | 40.80 % |
+| One-class SVM | 13.44 % | 47.58 % |
+| Mahalanobis | 13.55 % | 37.46 % |
+| **Siamese network** (mean of 3 runs) | 16.75 % | 71.15 % |
+| Manhattan | 19.90 % | 73.43 % |
+| Euclidean | 21.64 % | 79.78 % |
+
+With 51 people the Siamese network does **not** beat the simple per-user methods.
+It overfits the ~41 training people (so it is stopped after 3 epochs, chosen on a
+separate validation split) and ignores each owner's own spread. It may need more
+people or raw key events.
+
 ## Adding a new method
 
 Write a function that takes the training matrix and returns a scoring function
@@ -73,8 +99,8 @@ def my_method(train):
     return lambda X: ...      # one score per row of X
 ```
 
-Planned: a Siamese network, then raw-sequence LSTM / Transformer models on a
-dataset with raw key events (for example the Aalto 136M keystrokes data).
+Planned: raw-sequence LSTM / Transformer models on a dataset with raw key events
+and many more people (for example the Aalto 136M keystrokes data).
 
 ## Important limits
 
