@@ -25,7 +25,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from compiler import CppCompiler, grade_submission
-from data_manager import DEFAULT_STARTER_CODE, DataManager
+from data_manager import DEFAULT_STARTER_CODE, DataManager, exam_state, exam_window
 from ml_model import AUTH_THRESHOLD, DEFAULT_MODEL_DIR, BehavioralAuthModel
 
 
@@ -535,6 +535,7 @@ def _init_state() -> None:
         "consecutive_fails": 0,
         "exam_verified": False,
         "exam_start_time": None,
+        "exam_deadline": None,
         "exam_submitted": False,
         # UI
         "_login_stage": "role",  # role | login | register
@@ -613,7 +614,7 @@ def _handle_payload(payload: Optional[Dict[str, Any]]) -> bool:
     elif kind == "exam_cp_event":
         _handle_cp_event(dm, payload)
     elif kind == "exam_answer":
-        _handle_exam_answer_update(payload)
+        _handle_exam_answer_update(dm, payload)
     elif kind == "lab_run":
         _handle_lab_run(dm, payload)
     elif kind == "lab_submit":
@@ -691,6 +692,8 @@ def _handle_exam_continuous(dm: DataManager, payload: Dict[str, Any]) -> None:
     st.session_state.auth_log.append(
         {"timestamp": time.time(), "confidence": conf, "status": status}
     )
+    if isinstance(payload.get("answers"), dict):  # each check also checkpoints answers
+        _handle_exam_answer_update(dm, payload)
 
 
 def _handle_cp_event(dm: DataManager, payload: Dict[str, Any]) -> None:
@@ -713,11 +716,18 @@ def _handle_cp_event(dm: DataManager, payload: Dict[str, Any]) -> None:
     )
 
 
-def _handle_exam_answer_update(payload: Dict[str, Any]) -> None:
-    """Sync answers from the iframe textareas back into session_state."""
+def _handle_exam_answer_update(dm: DataManager, payload: Dict[str, Any]) -> None:
+    """Sync answers from the iframe into session_state and the database draft."""
     answers = payload.get("answers") or {}
-    if isinstance(answers, dict):
-        st.session_state.exam_answers.update(answers)
+    if not isinstance(answers, dict):
+        return
+    deadline = st.session_state.exam_deadline
+    if deadline and time.time() > deadline + 2:  # late edits do not count
+        return
+    st.session_state.exam_answers.update({str(k): str(v) for k, v in answers.items()})
+    eid, user = st.session_state.active_exam_id, st.session_state.username
+    if eid and user:
+        dm.update_draft_answers(user, eid, st.session_state.exam_answers)
 
 
 def _handle_lab_run(dm: DataManager, payload: Dict[str, Any]) -> None:
@@ -1083,19 +1093,7 @@ def _reg_step1(dm) -> None:
         enrollment_no = st.text_input("Enrollment Number", placeholder="EN21CS001")
         password = st.text_input("Password", type="password")
         confirm = st.text_input("Confirm Password", type="password")
-        # Faculty/course selector
-        faculty_list = dm.get_all_faculty()
-        course_options = []
-        fac_map = {}
-        for f in faculty_list:
-            label = f"{f.get('course_name', 'Course')} ({f.get('full_name', 'Faculty')})"
-            course_options.append(label)
-            fac_map[label] = f["username"]
-        selected_course = None
-        if course_options:
-            selected_course = st.selectbox("Select your course & faculty", course_options)
-        else:
-            st.caption("No faculty courses available yet.")
+        st.caption("Your faculty will add you to their course after you register.")
         submitted = st.form_submit_button("Next →", type="primary", width='stretch')
     if st.session_state._signup_error:
         st.markdown(f"<div style='color:#fca5a5;font-size:13px;margin-top:6px;'>{st.session_state._signup_error}</div>", unsafe_allow_html=True)
@@ -1116,8 +1114,6 @@ def _reg_step1(dm) -> None:
             "username": uname,
             "password": password,
             "enrollment_no": enrollment_no.strip(),
-            "faculty_username": fac_map.get(selected_course, "") if selected_course else "",
-            "course_label": selected_course or "",
         }
         st.session_state.reg_step = 2
         st.session_state.reg_samples = []
@@ -1183,8 +1179,6 @@ def _reg_step3(dm) -> None:
                 st.rerun()
                 return
             dm.save_keystroke_samples(rd["username"], samples)
-            if rd.get("faculty_username"):
-                dm.enroll_student(rd["username"], rd["faculty_username"])
             st.session_state["_reg_train_result"] = retrain_model()
             st.session_state["_reg_done"] = True
     train_result = st.session_state.get("_reg_train_result")
@@ -1194,7 +1188,7 @@ def _reg_step3(dm) -> None:
     st.markdown(
         f"<div style='background:rgba(255,255,255,0.06);border-radius:12px;padding:16px;margin-bottom:16px;'>"
         f"<div style='color:#94a3b8;font-size:12px;'>Username</div><div style='color:white;font-weight:600;'>{rd['username']}</div>"
-        f"<div style='color:#94a3b8;font-size:12px;margin-top:8px;'>Course</div><div style='color:white;font-weight:600;'>{rd.get('course_label','N/A')}</div>"
+        f"<div style='color:#94a3b8;font-size:12px;margin-top:8px;'>Course</div><div style='color:white;font-weight:600;'>Pending — your faculty will enroll you</div>"
         f"<div style='color:#94a3b8;font-size:12px;margin-top:8px;'>Samples collected</div><div style='color:white;font-weight:600;'>{len(samples)}</div>"
         f"</div>",
         unsafe_allow_html=True,
@@ -1220,6 +1214,7 @@ _FACULTY_NAV = [
     ("overview", "📊  Overview"),
     ("exams", "📝  Exam Management"),
     ("lab", "🧪  Code Lab"),
+    ("students", "🎓  Students"),
     ("reports", "📋  Reports"),
     ("settings", "⚙️  Settings"),
 ]
@@ -1374,9 +1369,9 @@ def show_faculty_overview() -> None:
                     'test cases under <b>Code Lab</b>.</div></div>'
                     '<div style="flex:1;min-width:200px;">'
                     '<div style="font-size:13.5px;font-weight:700;color:var(--text);margin-bottom:4px;">'
-                    '③ Share your course</div>'
-                    '<div style="font-size:12.5px;color:#94a3b8;line-height:1.6;">Students register with '
-                    'your course name to appear on this dashboard.</div></div>'
+                    '③ Enroll your students</div>'
+                    '<div style="font-size:12.5px;color:#94a3b8;line-height:1.6;">Open <b>Students</b> '
+                    'and pick from the registered students to add them to your course.</div></div>'
                     '</div>',
                     unsafe_allow_html=True,
                 )
@@ -1401,10 +1396,19 @@ def show_faculty_exams() -> None:
 
 
 def _faculty_create_exam_form() -> None:
-    """Form to compose an exam (questions + PDF parse) and persist it."""
+    """Compose an exam (questions + PDF parse) and persist it.
+
+    Deliberately NOT inside st.form: a form only reruns on submit, so choosing
+    "MCQ" would not reveal the option fields until after saving. Plain widgets
+    rerun on every change, so the option inputs appear immediately.
+    """
     dm = get_data_manager()
     if "_exam_q_count" not in st.session_state:
         st.session_state._exam_q_count = 5
+    g = st.session_state.get("_exam_form_gen", 0)  # bumped after saving to clear the form
+    saved = st.session_state.pop("_exam_saved_msg", None)
+    if saved:
+        st.success(saved)
 
     cc1, cc2, _ = st.columns([1, 1, 4])
     with cc1:
@@ -1423,85 +1427,97 @@ def _faculty_create_exam_form() -> None:
         pdf_text = _extract_pdf_text(pdf_file)
         st.text_area("Extracted PDF text (review)", value=pdf_text, height=200, key="_pdf_text")
 
-    with st.form("create_exam_form", clear_on_submit=False):
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            title = st.text_input("Exam title", placeholder="Mid-Sem — Data Structures")
-            subject = st.text_input(
-                "Subject / course", value=st.session_state.course_name or ""
-            )
-            instructions = st.text_area(
-                "Instructions", height=80, placeholder="Read carefully…"
-            )
-        with c2:
-            edate = st.date_input("Exam date", value=date.today())
-            etime = st.time_input("Start time", value=dtime(10, 0))
-            duration = st.slider("Duration (minutes)", 30, 180, 60)
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        title = st.text_input("Exam title", placeholder="Mid-Sem — Data Structures",
+                              key=f"ex_title_{g}")
+        subject = st.text_input(
+            "Subject / course", value=st.session_state.course_name or "", key=f"ex_subj_{g}"
+        )
+        instructions = st.text_area(
+            "Instructions", height=80, placeholder="Read carefully…", key=f"ex_instr_{g}"
+        )
+    with c2:
+        edate = st.date_input("Opens on", value=date.today(), key=f"ex_date_{g}")
+        etime = st.time_input("Opens at", value=dtime(10, 0), key=f"ex_time_{g}")
+        duration = st.slider("Duration (minutes)", 30, 180, 60, key=f"ex_dur_{g}")
+        window = st.number_input(
+            "Stays open for (min, 0 = same as duration)", 0, 10080, 0, key=f"ex_win_{g}",
+            help="How long students can start the exam after it opens.",
+        )
 
-        st.markdown(f"##### Questions ({st.session_state._exam_q_count})")
-        questions: List[Dict[str, Any]] = []
-        for i in range(st.session_state._exam_q_count):
-            with st.expander(f"Question {i + 1}", expanded=(i == 0)):
-                qa, qb = st.columns([3, 1])
-                with qa:
-                    qtype = st.selectbox(
-                        "Type", ["Descriptive", "MCQ"], key=f"qt_{i}"
-                    )
-                    qtext_default = pdf_text if (i == 0 and pdf_text) else ""
-                    qtext = st.text_area(
-                        f"Question text {i + 1}",
-                        value=qtext_default,
-                        height=100,
-                        key=f"qtext_{i}",
-                    )
-                with qb:
-                    marks = st.number_input(
-                        "Marks", min_value=1, max_value=50, value=10, step=1, key=f"qm_{i}"
-                    )
-                if qtype == "MCQ":
-                    o1 = st.text_input("Option A", key=f"o1_{i}")
-                    o2 = st.text_input("Option B", key=f"o2_{i}")
-                    o3 = st.text_input("Option C", key=f"o3_{i}")
-                    o4 = st.text_input("Option D", key=f"o4_{i}")
-                    correct = st.radio(
-                        "Correct option",
-                        ["A", "B", "C", "D"],
-                        horizontal=True,
-                        key=f"corr_{i}",
-                    )
-                    options = [o1, o2, o3, o4]
-                else:
-                    options = []
-                    correct = ""
-                questions.append(
-                    {
-                        "q_id": f"q{i + 1}",
-                        "type": qtype,
-                        "text": qtext,
-                        "marks": int(marks),
-                        "options": options,
-                        "correct": correct,
-                    }
+    st.markdown(f"##### Questions ({st.session_state._exam_q_count})")
+    questions: List[Dict[str, Any]] = []
+    for i in range(st.session_state._exam_q_count):
+        with st.expander(f"Question {i + 1}", expanded=(i == 0)):
+            qa, qb = st.columns([3, 1])
+            with qa:
+                qtype = st.selectbox(
+                    "Type", ["Descriptive", "MCQ"], key=f"qt_{g}_{i}"
                 )
-
-        ok = st.form_submit_button("💾  Save exam", width='stretch')
-        if ok:
-            if not title.strip():
-                st.error("Title is required.")
-            elif not any(q["text"].strip() for q in questions):
-                st.error("Add at least one question.")
+                qtext_default = pdf_text if (i == 0 and pdf_text) else ""
+                qtext = st.text_area(
+                    f"Question text {i + 1}",
+                    value=qtext_default,
+                    height=100,
+                    key=f"qtext_{g}_{i}",
+                )
+            with qb:
+                marks = st.number_input(
+                    "Marks", min_value=1, max_value=50, value=10, step=1, key=f"qm_{g}_{i}"
+                )
+            if qtype == "MCQ":
+                options = [
+                    st.text_input(f"Option {L}", key=f"o{k}_{g}_{i}")
+                    for k, L in enumerate("ABCD")
+                ]
+                correct = st.radio(
+                    "Correct option", ["A", "B", "C", "D"], horizontal=True,
+                    key=f"corr_{g}_{i}",
+                )
             else:
-                eid = dm.create_exam(
-                    faculty_username=st.session_state.username,
-                    title=title.strip(),
-                    subject=subject.strip(),
-                    date=str(edate),
-                    start_time=etime.strftime("%H:%M"),
-                    duration_mins=int(duration),
-                    instructions=instructions,
-                    questions=[q for q in questions if q["text"].strip()],
-                )
-                st.success(f"Saved exam id={eid}.")
+                options, correct = [], ""
+            questions.append(
+                {
+                    "q_id": f"q{i + 1}",
+                    "type": qtype,
+                    "text": qtext,
+                    "marks": int(marks),
+                    "options": [o.strip() for o in options],
+                    "correct": correct,
+                }
+            )
+
+    if st.button("💾  Save exam", width="stretch", key=f"ex_save_{g}"):
+        filled = [q for q in questions if q["text"].strip()]
+        bad_mcq = next(
+            (q["q_id"] for q in filled if q["type"] == "MCQ"
+             and (any(not o for o in q["options"])
+                  or len({o.lower() for o in q["options"]}) != 4)),
+            None,
+        )
+        if not title.strip():
+            st.error("Title is required.")
+        elif not filled:
+            st.error("Add at least one question.")
+        elif bad_mcq:
+            st.error(f"{bad_mcq.upper()}: an MCQ needs four different, non-empty options.")
+        else:
+            eid = dm.create_exam(
+                faculty_username=st.session_state.username,
+                title=title.strip(),
+                subject=subject.strip(),
+                date=str(edate),
+                start_time=etime.strftime("%H:%M"),
+                duration_mins=int(duration),
+                instructions=instructions,
+                questions=filled,
+                window_mins=int(window) or None,
+            )
+            st.session_state._exam_form_gen = g + 1
+            st.session_state._exam_q_count = 5
+            st.session_state._exam_saved_msg = f"Saved exam id={eid}."
+            st.rerun()
 
 
 def _faculty_active_exams() -> None:
@@ -1513,11 +1529,15 @@ def _faculty_active_exams() -> None:
                "Switch to the \u201cCreate exam\u201d tab to build your first proctored exam.")
         return
     for e in exams:
-        sts_cls = {
-            "upcoming": "badge-upcoming",
-            "active": "badge-active",
-            "ended": "badge-ended",
-        }.get(e.get("status", "upcoming"), "badge-upcoming")
+        state = exam_state(e)
+        sts_cls = {"upcoming": "badge-upcoming", "open": "badge-active",
+                   "closed": "badge-ended"}[state]
+        opens, closes = exam_window(e)
+        window_txt = (
+            f"opens {datetime.fromtimestamp(opens):%d %b %H:%M}, "
+            f"closes {datetime.fromtimestamp(closes):%d %b %H:%M}"
+            if closes != float("inf") else "always open"
+        )
         st.markdown(
             f'<div class="tp-card">'
             f'<div style="display:flex;justify-content:space-between;align-items:center;gap:14px;">'
@@ -1530,11 +1550,30 @@ def _faculty_active_exams() -> None:
             f'<div style="color:#94a3b8;font-size:12.5px;margin-top:3px;">'
             f'{e["subject"]} · {e["date"]} {e.get("start_time","")} · '
             f'{e["duration_mins"]} min · {len(e["questions"])} questions</div>'
+            f'<div style="color:#94a3b8;font-size:12px;margin-top:2px;">{window_txt}</div>'
             f'</div></div>'
-            f'<span class="badge {sts_cls}" style="flex-shrink:0;">{e.get("status","upcoming").upper()}</span>'
+            f'<span class="badge {sts_cls}" style="flex-shrink:0;">{state.upper()}</span>'
             f'</div></div>',
             unsafe_allow_html=True,
         )
+        with st.expander("🗓 Reschedule", expanded=False):
+            with st.form(f"resched_{e['exam_id']}"):
+                r1, r2, r3 = st.columns(3)
+                try:
+                    d0 = datetime.strptime(e["date"], "%Y-%m-%d").date()
+                    t0 = datetime.strptime(e.get("start_time") or "10:00", "%H:%M").time()
+                except (ValueError, TypeError):
+                    d0, t0 = date.today(), dtime(10, 0)
+                nd = r1.date_input("Date", value=d0)
+                nt = r2.time_input("Start time", value=t0)
+                nw = r3.number_input("Stays open (min, 0 = same as duration)", 0, 10080,
+                                     value=int(e.get("window_mins") or 0))
+                if st.form_submit_button("Save schedule"):
+                    dm.update_exam(e["exam_id"], {
+                        "date": str(nd), "start_time": nt.strftime("%H:%M"),
+                        "window_mins": int(nw) or None,
+                    })
+                    st.rerun()
 
 
 def _faculty_exam_submissions() -> None:
@@ -1550,10 +1589,13 @@ def _faculty_exam_submissions() -> None:
         options=list(eid_map.keys()),
         format_func=lambda k: eid_map[k],
     )
+    _finalize_expired(dm, exam_id=eid)  # submit attempts whose time ran out
     subs = dm.get_exam_submissions(exam_id=eid)
+    eid_exam = dm.get_exam(eid)
     if not subs:
         _empty("📭", "No submissions yet", "Once students complete this exam, their submissions will show up here.")
         return
+    mcq_total = sum(int(q.get("marks", 0)) for q in eid_exam["questions"] if q.get("type") == "MCQ")
     rows = []
     for s in subs:
         u = dm.get_user(s["username"]) or {}
@@ -1572,7 +1614,7 @@ def _faculty_exam_submissions() -> None:
                 ),
                 "Status": integrity["grade"],
                 "Integrity": f"{integrity['integrity_score']:.0f}%",
-                "Score": s.get("score", ""),
+                "Score": f"{s.get('score', 0)}/{mcq_total}" if mcq_total else s.get("score", ""),
                 "_username": s["username"],
                 "_session_id": s["session_id"],
             }
@@ -1610,7 +1652,15 @@ def _faculty_exam_submissions() -> None:
     for q in exam["questions"]:
         with st.expander(f"Q{q['q_id'][1:]}. {q['text'][:80]}…", expanded=False):
             ans = sub.get("answers", {}).get(q["q_id"], "")
-            st.write(ans or "_(blank)_")
+            if q.get("type") == "MCQ":
+                right = (ans or "").upper()[:1] == (q.get("correct") or "").upper()[:1] and bool(ans)
+                st.write(
+                    f"{'✅' if right else '❌'} Chosen: **{ans or '—'}** · "
+                    f"Correct: **{q.get('correct', '?')}** · "
+                    f"{q.get('marks', 0) if right else 0}/{q.get('marks', 0)} marks"
+                )
+            else:
+                st.write(ans or "_(blank)_")
 
     if auth_log:
         st.markdown("**Behavioural auth timeline**")
@@ -1959,7 +2009,7 @@ def show_faculty_reports() -> None:
         students = dm.get_faculty_students(st.session_state.username)
         if not students:
             _empty("📋", "No students enrolled yet",
-                   "Once students register under your course, their reports will appear here.")
+                   "Once you enroll students (Students page), their reports will appear here.")
             return
         sopt = {s["username"]: s.get("full_name", s["username"]) for s in students}
         sel = st.selectbox(
@@ -2018,6 +2068,80 @@ def show_faculty_reports() -> None:
     _faculty_layout(_content)
 
 
+# ── Faculty: Students (enrol registered students into the course) ──────────
+def show_faculty_students() -> None:
+    """Faculty choose which registered students join their course."""
+    def _content():
+        dm = get_data_manager()
+        me = st.session_state.username
+        _page_header(
+            "🎓", "Students",
+            f"Choose which registered students join {st.session_state.course_name or 'your course'}. "
+            "Enrolled students see your exams, quizzes and labs.",
+        )
+        flash = st.session_state.pop("_students_msg", None)
+        if flash:
+            st.success(flash)
+
+        pool = dm.get_unenrolled_students(me)
+        enrolled = dm.get_faculty_students(me)
+
+        st.markdown(f"### Registered students not in your course ({len(pool)})")
+        if not pool:
+            _empty("✅", "No one waiting",
+                   "Every registered student is already enrolled. New sign-ups appear here.")
+        else:
+            by_user = {s["username"]: s for s in pool}
+            picked = st.multiselect(
+                "Select students to enroll (type to search by name, username or enrollment no.)",
+                options=list(by_user),
+                format_func=lambda u: (
+                    f"{by_user[u].get('full_name') or u} · {by_user[u].get('enrollment_no') or '—'}"
+                    f" · @{u}"
+                ),
+                key="enroll_pick",
+            )
+            b1, b2, _ = st.columns([1.2, 1.2, 4])
+            if b1.button("➕ Enroll selected", type="primary", disabled=not picked,
+                         key="enroll_sel"):
+                for u in picked:
+                    dm.enroll_student(u, me)
+                st.session_state.pop("enroll_pick", None)
+                st.session_state._students_msg = f"Enrolled {len(picked)} student(s)."
+                st.rerun()
+            if b2.button(f"➕ Enroll all ({len(pool)})", key="enroll_all"):
+                for s in pool:
+                    dm.enroll_student(s["username"], me)
+                st.session_state.pop("enroll_pick", None)
+                st.session_state._students_msg = f"Enrolled {len(pool)} student(s)."
+                st.rerun()
+
+        st.markdown(f"### Enrolled in your course ({len(enrolled)})")
+        if not enrolled:
+            _empty("🎓", "No students enrolled yet",
+                   "Pick students from the list above to add them to your course.")
+        for s in enrolled:
+            c1, c2 = st.columns([6, 1])
+            with c1:
+                st.markdown(
+                    "<div class='feed-row'><div class='fr-left'>"
+                    f"<div class='avatar' style='width:32px;height:32px;font-size:12px;'>"
+                    f"{_initials(s.get('full_name'), 'S')}</div>"
+                    f"<span><b style='color:var(--text);'>{s.get('full_name') or s['username']}</b> "
+                    f"<span style='color:#94a3b8;font-size:12.5px;'>· {s.get('enrollment_no') or '—'}"
+                    f" · @{s['username']}</span></span></div></div>",
+                    unsafe_allow_html=True,
+                )
+            if c2.button("Remove", key=f"unenroll_{s['username']}"):
+                dm.unenroll_student(s["username"], me)
+                st.session_state._students_msg = (
+                    f"Removed {s.get('full_name') or s['username']} from your course."
+                )
+                st.rerun()
+
+    _faculty_layout(_content)
+
+
 # ── Faculty: Settings ───────────────────────────────────────────────────────
 def show_faculty_settings() -> None:
     """Settings: change course name + view enrolled students."""
@@ -2066,7 +2190,7 @@ def show_faculty_settings() -> None:
             students = dm.get_faculty_students(st.session_state.username)
             if not students:
                 _empty("🎓", "No students enrolled yet",
-                       "Share your course name with students so they can register.")
+                       "Go to the Students page to enroll registered students.")
             else:
                 for s in students:
                     initials = "".join(x[0] for x in (s.get("full_name", "S")).split()[:2]).upper()
@@ -2106,8 +2230,8 @@ def show_student_courses() -> None:
         courses = dm.get_student_courses(st.session_state.username)
         if not courses:
             _empty("🎓", "No courses yet",
-                   "You are not enrolled in any course yet. Ask your professor to add you, "
-                   "or run <code>python seed_demo.py</code> for demo data.", dark=True)
+                   "Your faculty enrolls students into their course. Once they add you, "
+                   "it will show up here.", dark=True)
             return
         cols = st.columns(3, gap="medium")
         for i, fac in enumerate(courses):
@@ -2144,6 +2268,10 @@ def show_student_course_detail() -> None:
     def _content():
         dm = get_data_manager()
         fac = dm.get_user(st.session_state.selected_course or "") or {}
+        # Enrolment can be revoked at any time; never show a course the student has left.
+        if not fac or not dm.is_enrolled(st.session_state.username, fac["username"]):
+            _goto("courses")
+            return
         st.markdown(
             f'<a href="?back=1" style="color:#a5b4fc;font-size:13px;">← Home</a>'
             f'<h1 class="tp-title-dark" style="margin-top:4px;">'
@@ -2156,13 +2284,25 @@ def show_student_course_detail() -> None:
             _goto("courses")
         t1, t2 = st.tabs(["📝 Exams", "🧪 Labs"])
         with t1:
+            _finalize_expired(dm, username=st.session_state.username)
             exam_list = dm.get_exams(faculty_username=fac["username"])
             if not exam_list:
                 _empty("📝", "No exams yet", "Your instructor hasn't published any exams for this course.", dark=True)
             for e in exam_list:
                 sub = dm.get_exam_submission(st.session_state.username, e["exam_id"])
-                status = "Submitted" if sub else "Not started"
-                badge = "badge-active" if sub else "badge-upcoming"
+                draft = None if sub else dm.get_draft(st.session_state.username, e["exam_id"])
+                state = exam_state(e)
+                opens, closes = exam_window(e)
+                if sub:
+                    status, badge = "Submitted", "badge-active"
+                elif draft:
+                    status, badge = "In progress", "badge-warning"
+                elif state == "open":
+                    status, badge = "Open", "badge-active"
+                elif state == "upcoming":
+                    status, badge = "Upcoming", "badge-upcoming"
+                else:
+                    status, badge = "Closed", "badge-ended"
                 st.markdown(
                     f'<div class="tp-card-dark">'
                     f'<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">'
@@ -2178,7 +2318,25 @@ def show_student_course_detail() -> None:
                     f'</div></div>',
                     unsafe_allow_html=True,
                 )
-                if not sub:
+                fmt = "%d %b %H:%M"
+                if draft:
+                    if st.button(f"Resume exam: {e['title']}", key=f"resume_{e['exam_id']}", type="primary"):
+                        st.session_state.active_exam_id = e["exam_id"]
+                        st.session_state.exam_answers = dict(draft["answers"])
+                        st.session_state.session_id = draft["session_id"]
+                        st.session_state.exam_start_time = draft["started_at"]
+                        st.session_state.exam_deadline = draft["deadline"]
+                        st.session_state.auth_log = dm.get_auth_log(
+                            st.session_state.username, draft["session_id"])
+                        st.session_state.cp_log = dm.get_cp_log(
+                            st.session_state.username, draft["session_id"])
+                        st.session_state.consecutive_fails = 0
+                        st.session_state.exam_verified = True  # identity was verified at login
+                        st.session_state.exam_submitted = False
+                        _goto("exam_portal")
+                elif not sub and state == "open":
+                    st.caption(f"Open until {datetime.fromtimestamp(closes).strftime(fmt)} · "
+                               f"you get {e['duration_mins']} min once you start.")
                     if st.button(f"Start exam: {e['title']}", key=f"start_{e['exam_id']}", type="primary"):
                         st.session_state.active_exam_id = e["exam_id"]
                         st.session_state.exam_answers = {}
@@ -2189,7 +2347,12 @@ def show_student_course_detail() -> None:
                         st.session_state.exam_verified = False
                         st.session_state._verify_attempts = 0
                         st.session_state.exam_submitted = False
+                        st.session_state.exam_deadline = None
                         _goto("exam_verify")
+                elif not sub and state == "upcoming":
+                    st.caption(f"🔒 Opens {datetime.fromtimestamp(opens).strftime(fmt)}.")
+                elif not sub:
+                    st.caption("⛔ This exam is closed and no submission was recorded.")
                 else:
                     if st.button(f"View submission ({e['title']})", key=f"view_{e['exam_id']}"):
                         st.session_state.active_exam_id = e["exam_id"]
@@ -2238,6 +2401,11 @@ def show_exam_verification() -> None:
             f'phrase below to confirm your typing pattern.</p>',
             unsafe_allow_html=True,
         )
+        if exam and exam_state(exam) != "open":
+            st.error("This exam is not open right now.")
+            if st.button("← Back to course"):
+                _goto("course_detail")
+            return
         if st.session_state._verify_attempts >= 3:
             st.error(
                 "Verification failed 3 times. The faculty has been notified. "
@@ -2272,7 +2440,19 @@ def show_exam_verification() -> None:
         if st.session_state.exam_verified:
             st.success("Verification passed.")
             if st.button("Enter Exam →", type="primary"):
-                st.session_state.exam_start_time = time.time()
+                now = time.time()
+                _, closes = exam_window(exam)
+                if now >= closes:
+                    st.error("The exam window has just closed.")
+                    return
+                # The attempt ends after `duration` or when the window closes, whichever is first.
+                deadline = min(now + exam["duration_mins"] * 60, closes)
+                dm.start_draft(st.session_state.username, exam["exam_id"],
+                               st.session_state.session_id, now, deadline)
+                draft = dm.get_draft(st.session_state.username, exam["exam_id"])
+                st.session_state.exam_start_time = draft["started_at"]
+                st.session_state.exam_deadline = draft["deadline"]
+                st.session_state.session_id = draft["session_id"]
                 _goto("exam_portal")
         elif st.session_state._verify_attempts > 0:
             st.warning(
@@ -2294,9 +2474,11 @@ def show_exam_portal() -> None:
             _goto("submitted")
             return
         # Server-side clock is authoritative; the browser only displays a countdown.
-        elapsed = int(time.time() - (st.session_state.exam_start_time or time.time()))
         total = exam["duration_mins"] * 60
-        remaining = max(0, total - elapsed)
+        deadline = st.session_state.exam_deadline or (
+            (st.session_state.exam_start_time or time.time()) + total
+        )
+        remaining = max(0, int(deadline - time.time()))
         mm, ss = divmod(remaining, 60)
         warn = "warning" if remaining < 5 * 60 else ""
         # Client-side countdown: no page reload (a reload would start a new
@@ -2357,7 +2539,11 @@ def show_exam_portal() -> None:
             payload = tp_widget(
                 widget_type="exam_session",
                 exam_title=exam["title"],
-                questions=exam["questions"],
+                # Never send the answer key to the browser.
+                questions=[
+                    {k: v for k, v in q.items() if k not in ("correct", "explanation", "slide")}
+                    for q in exam["questions"]
+                ],
                 duration_ms=total * 1000,
                 started_at_ms=int((st.session_state.exam_start_time or time.time()) * 1000),
                 initial_answers=st.session_state.exam_answers,
@@ -2442,25 +2628,51 @@ def show_exam_portal() -> None:
 
 def _do_exam_submit(dm: DataManager, exam: Dict[str, Any]) -> None:
     """Persist the exam submission, integrity score and auth/cp logs."""
-    auth_log = st.session_state.auth_log
-    cp_log = st.session_state.cp_log
+    user = st.session_state.username
+    # A background finalisation (deadline passed) may already have saved it.
+    if dm.get_exam_submission(user, exam["exam_id"]) is None:
+        _save_submission(
+            dm, exam, user, st.session_state.session_id, st.session_state.exam_answers,
+            st.session_state.auth_log, st.session_state.cp_log,
+        )
+    dm.delete_draft(user, exam["exam_id"])
+    st.session_state.exam_submitted = True
+    _goto("submitted")
+
+
+def _save_submission(
+    dm: DataManager, exam: Dict[str, Any], user: str, session_id: str,
+    answers: Dict[str, str], auth_log: List[Dict], cp_log: List[Dict],
+) -> None:
+    """Grade MCQs, compute integrity and store the final submission."""
     avg_conf = (
         sum(a["confidence"] for a in auth_log) / len(auth_log) if auth_log else 0.0
     )
-    score = _auto_grade_mcq(exam, st.session_state.exam_answers)
-    integrity = dm.calculate_integrity_score(avg_conf, len(cp_log))
     dm.save_exam_submission(
-        username=st.session_state.username,
+        username=user,
         exam_id=exam["exam_id"],
-        session_id=st.session_state.session_id,
-        answers=st.session_state.exam_answers,
+        session_id=session_id,
+        answers=answers,
         auth_log=auth_log,
         cp_log=cp_log,
-        score=score,
-        integrity=integrity,
+        score=_auto_grade_mcq(exam, answers),
+        integrity=dm.calculate_integrity_score(avg_conf, len(cp_log)),
     )
-    st.session_state.exam_submitted = True
-    _goto("submitted")
+
+
+def _finalize_expired(
+    dm: DataManager, username: Optional[str] = None, exam_id: Optional[str] = None
+) -> None:
+    """Submit every attempt whose time ran out (student left or lost connection)."""
+    for d in dm.get_expired_drafts(username=username, exam_id=exam_id):
+        exam = dm.get_exam(d["exam_id"])
+        if exam and dm.get_exam_submission(d["username"], d["exam_id"]) is None:
+            _save_submission(
+                dm, exam, d["username"], d["session_id"], d["answers"],
+                dm.get_auth_log(d["username"], d["session_id"]),
+                dm.get_cp_log(d["username"], d["session_id"]),
+            )
+        dm.delete_draft(d["username"], d["exam_id"])
 
 
 def _auto_grade_mcq(exam: Dict[str, Any], answers: Dict[str, str]) -> int:
@@ -2601,7 +2813,14 @@ def show_submission_success() -> None:
         st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
         score = integrity["integrity_score"]
         score_accent = "green" if score >= 70 else "amber" if score >= 40 else "red"
-        c = st.columns(3)
+        mcqs = [q for q in exam.get("questions", []) if q.get("type") == "MCQ"]
+        mcq_total = sum(int(q.get("marks", 0)) for q in mcqs)
+        c = st.columns(4 if mcqs else 3)
+        if mcqs:
+            c.pop(0).markdown(
+                _metric("🎯", "Your Score", f"{sub.get('score', 0)}/{mcq_total}", "green", dark=True),
+                unsafe_allow_html=True,
+            )
         c[0].markdown(
             _metric("🛡️", "Integrity Score", f"{score:.0f}%", score_accent, dark=True, delta=integrity["grade"]),
             unsafe_allow_html=True,
@@ -2614,6 +2833,17 @@ def show_submission_success() -> None:
             _metric("📋", "Paste Events", str(sub.get('cp_count', 0)), "cyan", dark=True),
             unsafe_allow_html=True,
         )
+        if mcqs:
+            st.markdown("##### Question results")
+            for i, q in enumerate(mcqs, 1):
+                chosen = (sub.get("answers", {}).get(q["q_id"], "") or "").upper()[:1]
+                right = bool(chosen) and chosen == (q.get("correct") or "").upper()[:1]
+                st.markdown(
+                    f"<div class='{'tc-pass' if right else 'tc-fail'}'>Q{i} — "
+                    f"{'✅ correct' if right else ('❌ wrong' if chosen else '➖ not answered')}"
+                    f" · {q.get('marks', 0) if right else 0}/{q.get('marks', 0)} marks</div>",
+                    unsafe_allow_html=True,
+                )
         if st.button("← Back to courses"):
             _goto("courses")
     _student_layout(_content)
@@ -2631,7 +2861,8 @@ def main() -> None:
     if role == "faculty":
         if page == "overview":   show_faculty_overview()
         elif page == "exams":    show_faculty_exams()
-        elif page == "lab":      show_faculty_lab()
+        elif page == "lab":     show_faculty_lab()
+        elif page == "students": show_faculty_students()
         elif page == "reports":  show_faculty_reports()
         elif page == "settings": show_faculty_settings()
         else:                    show_faculty_overview()

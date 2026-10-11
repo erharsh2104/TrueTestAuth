@@ -7,6 +7,7 @@ Run once before a presentation:
 from __future__ import annotations
 
 import random
+from datetime import date
 from typing import Dict, List
 
 import numpy as np
@@ -116,8 +117,9 @@ def seed_demo_exam(dm: DataManager) -> str:
         faculty_username=FACULTY_USERNAME,
         title="Mid-Semester Exam — Data Structures",
         subject=COURSE_NAME,
-        date="2026-05-15",
-        start_time="10:00",
+        date=date.today().isoformat(),  # the exam window is enforced, so open it now
+        start_time="00:00",
+        window_mins=60 * 24 * 30,       # stays open for 30 days
         duration_mins=60,
         instructions=(
             "Answer all questions. Continuous behavioural verification is "

@@ -754,6 +754,12 @@
       t.addEventListener("blur", () => { if (dirty) pushAnswers(); });
     });
     radios.forEach(r => r.addEventListener("change", pushAnswers));
+    // Autosave while typing (not only on blur) so a crash/refresh loses < 8 s of work.
+    if (state.autosaveHandle) clearInterval(state.autosaveHandle);
+    state.autosaveHandle = setInterval(() => { if (dirty) pushAnswers(); }, 8000);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden" && dirty) pushAnswers();
+    });
 
     // Continuous-auth timer
     if (state.checkHandle) clearInterval(state.checkHandle);

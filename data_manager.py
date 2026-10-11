@@ -28,7 +28,8 @@ import secrets
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, Iterator, List, Optional
+from datetime import datetime
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -90,9 +91,21 @@ CREATE TABLE IF NOT EXISTS exams (
     instructions  TEXT,
     questions     TEXT NOT NULL,
     status        TEXT NOT NULL DEFAULT 'upcoming',
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    window_mins   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_exams_faculty ON exams(faculty);
+
+CREATE TABLE IF NOT EXISTS exam_drafts (
+    username   TEXT NOT NULL,
+    exam_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    answers    TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    deadline   REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (username, exam_id)
+);
 
 CREATE TABLE IF NOT EXISTS exam_submissions (
     username   TEXT NOT NULL,
@@ -160,6 +173,17 @@ CREATE TABLE IF NOT EXISTS cp_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_cp_user_session ON cp_logs(username, session_id);
 
+CREATE TABLE IF NOT EXISTS materials (
+    material_id TEXT PRIMARY KEY,
+    faculty     TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    filename    TEXT,
+    slides      TEXT NOT NULL,
+    topics      TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_materials_faculty ON materials(faculty);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -171,7 +195,7 @@ _CP_COLS = "username, session_id, event_type, question_id, chars, timestamp"
 _USER_UPDATABLE = {"password_hash", "full_name", "role", "course_name", "enrollment_no", "enrolled"}
 _EXAM_UPDATABLE = {
     "faculty", "title", "subject", "date", "start_time", "duration_mins",
-    "instructions", "questions", "status",
+    "instructions", "questions", "status", "window_mins",
 }
 
 
@@ -222,6 +246,32 @@ def _read_legacy_json(path: str, default: Any) -> Any:
         return default
 
 
+def exam_window(exam: Dict[str, Any]) -> Tuple[float, float]:
+    """(opens_ts, closes_ts) in server-local time.
+
+    Students may start between the two. `window_mins` is how long the exam stays
+    open to start; when unset it equals the duration. An unparseable date means
+    "always open" so old data can never lock students out.
+    """
+    try:
+        opens = datetime.strptime(
+            f"{exam['date']} {exam.get('start_time') or '00:00'}", "%Y-%m-%d %H:%M"
+        ).timestamp()
+    except (ValueError, TypeError, KeyError):
+        return 0.0, float("inf")
+    span = int(exam.get("window_mins") or exam.get("duration_mins") or 0)
+    return opens, opens + span * 60
+
+
+def exam_state(exam: Dict[str, Any], now: Optional[float] = None) -> str:
+    """'upcoming', 'open' or 'closed' for the exam's start window."""
+    now = time.time() if now is None else now
+    opens, closes = exam_window(exam)
+    if now < opens:
+        return "upcoming"
+    return "open" if now < closes else "closed"
+
+
 def _exam(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
     d["questions"] = _load(d["questions"]) or []
@@ -260,6 +310,10 @@ class DataManager:
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         with self._conn() as con:
             con.executescript(_SCHEMA)
+            # Databases created before the exam window existed need the new column.
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(exams)")}
+            if "window_mins" not in cols:
+                con.execute("ALTER TABLE exams ADD COLUMN window_mins INTEGER")
         self._auto_import_legacy_json()
 
     @contextlib.contextmanager
@@ -422,6 +476,31 @@ class DataManager:
         except sqlite3.IntegrityError:
             return False
 
+    def unenroll_student(self, student_username: str, faculty_username: str) -> bool:
+        """Remove a student from a faculty's course (their past work is kept)."""
+        with self._conn() as con:
+            return con.execute(
+                "DELETE FROM enrollments WHERE student = ? AND faculty = ?",
+                (student_username, faculty_username),
+            ).rowcount > 0
+
+    def is_enrolled(self, student_username: str, faculty_username: str) -> bool:
+        with self._conn() as con:
+            return con.execute(
+                "SELECT 1 FROM enrollments WHERE student = ? AND faculty = ?",
+                (student_username, faculty_username),
+            ).fetchone() is not None
+
+    def get_unenrolled_students(self, faculty_username: str) -> List[Dict]:
+        """Registered students who are not (yet) in this faculty's course."""
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT * FROM users WHERE role = 'student' AND username NOT IN"
+                " (SELECT student FROM enrollments WHERE faculty = ?) ORDER BY rowid",
+                (faculty_username,),
+            ).fetchall()
+            return [self._user_dict(con, r, with_samples=False) for r in rows]
+
     def get_student_courses(self, student_username: str) -> List[Dict]:
         with self._conn() as con:
             rows = con.execute(
@@ -484,15 +563,17 @@ class DataManager:
         instructions: str,
         questions: List[Dict],
         start_time: str = "10:00",
+        window_mins: Optional[int] = None,
     ) -> str:
         eid = uuid.uuid4().hex[:8]
         with self._conn() as con:
             con.execute(
                 "INSERT INTO exams (exam_id, faculty, title, subject, date, start_time,"
-                " duration_mins, instructions, questions, status, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'upcoming', ?)",
+                " duration_mins, instructions, questions, status, created_at, window_mins)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'upcoming', ?, ?)",
                 (eid, faculty_username, title, subject, date, start_time,
-                 int(duration_mins), instructions, _dump(questions), time.time()),
+                 int(duration_mins), instructions, _dump(questions), time.time(),
+                 int(window_mins) if window_mins else None),
             )
         return eid
 
@@ -528,6 +609,69 @@ class DataManager:
     def delete_exam(self, exam_id: str) -> bool:
         with self._conn() as con:
             return con.execute("DELETE FROM exams WHERE exam_id = ?", (exam_id,)).rowcount > 0
+
+    # ── In-progress exam drafts (answers survive refresh / crash) ───────────
+    @staticmethod
+    def _draft(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        d["answers"] = _load(d["answers"]) or {}
+        return d
+
+    def start_draft(
+        self, username: str, exam_id: str, session_id: str, started_at: float, deadline: float
+    ) -> Dict[str, Any]:
+        """Create the draft for an attempt (keeps an existing one) and return it."""
+        with self._conn() as con:
+            con.execute(
+                "INSERT OR IGNORE INTO exam_drafts (username, exam_id, session_id, answers,"
+                " started_at, deadline, updated_at) VALUES (?, ?, ?, '{}', ?, ?, ?)",
+                (username, exam_id, session_id, started_at, deadline, time.time()),
+            )
+            return self._draft(con.execute(
+                "SELECT * FROM exam_drafts WHERE username = ? AND exam_id = ?",
+                (username, exam_id),
+            ).fetchone())
+
+    def update_draft_answers(self, username: str, exam_id: str, answers: Dict[str, str]) -> bool:
+        """Save answers into an existing draft only (never recreates a finished one)."""
+        with self._conn() as con:
+            return con.execute(
+                "UPDATE exam_drafts SET answers = ?, updated_at = ?"
+                " WHERE username = ? AND exam_id = ?",
+                (_dump(answers), time.time(), username, exam_id),
+            ).rowcount > 0
+
+    def get_draft(self, username: str, exam_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT * FROM exam_drafts WHERE username = ? AND exam_id = ?",
+                (username, exam_id),
+            ).fetchone()
+            return self._draft(row) if row else None
+
+    def delete_draft(self, username: str, exam_id: str) -> None:
+        with self._conn() as con:
+            con.execute(
+                "DELETE FROM exam_drafts WHERE username = ? AND exam_id = ?",
+                (username, exam_id),
+            )
+
+    def get_expired_drafts(
+        self, username: Optional[str] = None, exam_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Drafts whose deadline has passed (they still need to be submitted)."""
+        where, args = ["deadline <= ?"], [time.time()]
+        if username:
+            where.append("username = ?")
+            args.append(username)
+        if exam_id:
+            where.append("exam_id = ?")
+            args.append(exam_id)
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT * FROM exam_drafts WHERE " + " AND ".join(where), args
+            ).fetchall()
+            return [self._draft(r) for r in rows]
 
     # ── Exam submissions ────────────────────────────────────────────────────
     def save_exam_submission(
@@ -582,6 +726,47 @@ class DataManager:
         with self._conn() as con:
             rows = con.execute(sql + " ORDER BY timestamp DESC, rowid", args).fetchall()
             return [_exam_sub(r) for r in rows]
+
+    # ── Lecture materials (slides + topics) ─────────────────────────────────
+    def create_material(
+        self,
+        faculty_username: str,
+        title: str,
+        filename: str,
+        slides: List[Dict],
+        topics: List[Dict],
+    ) -> str:
+        mid = uuid.uuid4().hex[:8]
+        with self._conn() as con:
+            con.execute(
+                "INSERT INTO materials (material_id, faculty, title, filename, slides,"
+                " topics, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (mid, faculty_username, title, filename, _dump(slides), _dump(topics),
+                 time.time()),
+            )
+        return mid
+
+    @staticmethod
+    def _material(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        d["slides"] = _load(d["slides"]) or []
+        d["topics"] = _load(d["topics"]) or []
+        return d
+
+    def get_materials(self, faculty_username: str) -> List[Dict]:
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT * FROM materials WHERE faculty = ? ORDER BY created_at DESC, rowid",
+                (faculty_username,),
+            ).fetchall()
+            return [self._material(r) for r in rows]
+
+    def delete_material(self, material_id: str, faculty_username: str) -> bool:
+        with self._conn() as con:
+            return con.execute(
+                "DELETE FROM materials WHERE material_id = ? AND faculty = ?",
+                (material_id, faculty_username),
+            ).rowcount > 0
 
     # ── Labs ────────────────────────────────────────────────────────────────
     def create_lab(
