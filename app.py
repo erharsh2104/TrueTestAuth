@@ -2535,6 +2535,109 @@ def show_student_courses() -> None:
     _student_layout(_content)
 
 
+EXAM_REFRESH_S = 5  # how often a waiting student's page re-checks the clock
+
+
+def _until(ts: float) -> str:
+    """'2 min 05 s', '1 h 05 min' ... until the timestamp `ts`."""
+    s = max(0, int(ts - time.time()))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d} d {h} h"
+    if h:
+        return f"{h} h {m:02d} min"
+    if m:
+        return f"{m} min {s:02d} s"
+    return f"{s} s"
+
+
+def _student_exam_list(username: str, fac_username: str, auto: bool = False) -> None:
+    """The exam cards of one course.
+
+    Streamlit only redraws a page when the user does something, so a student waiting
+    for an exam would see "Upcoming" forever. While any exam is waiting to open this
+    runs as a fragment (`auto=True`) that redraws itself every few seconds, so the
+    exam flips to Open, and its Start button appears, by itself.
+    """
+    dm = get_data_manager()
+    _finalize_expired(dm, username=st.session_state.username)
+    exam_list = dm.get_exams(faculty_username=fac_username)
+    if not exam_list:
+        _empty("📝", "No exams yet", "Your instructor hasn't published any exams for this course.", dark=True)
+    for e in exam_list:
+        sub = dm.get_exam_submission(st.session_state.username, e["exam_id"])
+        draft = None if sub else dm.get_draft(st.session_state.username, e["exam_id"])
+        state = exam_state(e)
+        opens, closes = exam_window(e)
+        if sub:
+            status, badge = "Submitted", "badge-active"
+        elif draft:
+            status, badge = "In progress", "badge-warning"
+        elif state == "open":
+            status, badge = "Open", "badge-active"
+        elif state == "upcoming":
+            status, badge = "Upcoming", "badge-upcoming"
+        else:
+            status, badge = "Closed", "badge-ended"
+        st.markdown(
+            f'<div class="tp-card-dark">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">'
+            f'<div style="display:flex;align-items:center;gap:12px;min-width:0;">'
+            f'<div class="m-icon" style="background:rgba(91,94,244,0.14);color:#a5b4fc;'
+            f'width:38px;height:38px;border-radius:11px;font-size:16px;flex-shrink:0;'
+            f'display:flex;align-items:center;justify-content:center;">📝</div>'
+            f'<div><b style="color:white;">{e["title"]}</b>'
+            f'<div style="color:#94a3b8;font-size:12px;margin-top:3px;">'
+            f'{e["date"]} {e.get("start_time","")} · '
+            f'{e["duration_mins"]} min · {len(e["questions"])} questions</div></div></div>'
+            f'<span class="badge {badge}" style="flex-shrink:0;">{status.upper()}</span>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        fmt = "%d %b %H:%M"
+        if draft:
+            if st.button(f"Resume exam: {e['title']}", key=f"resume_{e['exam_id']}", type="primary"):
+                st.session_state.active_exam_id = e["exam_id"]
+                st.session_state.exam_answers = dict(draft["answers"])
+                st.session_state.session_id = draft["session_id"]
+                st.session_state.exam_start_time = draft["started_at"]
+                st.session_state.exam_deadline = draft["deadline"]
+                st.session_state.auth_log = dm.get_auth_log(
+                    st.session_state.username, draft["session_id"])
+                st.session_state.cp_log = dm.get_cp_log(
+                    st.session_state.username, draft["session_id"])
+                st.session_state.consecutive_fails = 0
+                st.session_state.exam_verified = True  # identity was verified at login
+                st.session_state.exam_submitted = False
+                _goto("exam_portal")
+        elif not sub and state == "open":
+            st.caption(f"Open until {datetime.fromtimestamp(closes).strftime(fmt)} · "
+                       f"you get {e['duration_mins']} min once you start.")
+            if st.button(f"Start exam: {e['title']}", key=f"start_{e['exam_id']}", type="primary"):
+                st.session_state.active_exam_id = e["exam_id"]
+                st.session_state.exam_answers = {}
+                st.session_state.auth_log = []
+                st.session_state.cp_log = []
+                st.session_state.session_id = uuid.uuid4().hex
+                st.session_state.consecutive_fails = 0
+                st.session_state.exam_verified = False
+                st.session_state._verify_attempts = 0
+                st.session_state.exam_submitted = False
+                st.session_state.exam_deadline = None
+                _goto("exam_verify")
+        elif not sub and state == "upcoming":
+            st.caption(f"🔒 Opens {datetime.fromtimestamp(opens).strftime(fmt)} · in {_until(opens)}.")
+        elif not sub:
+            st.caption("⛔ This exam is closed and no submission was recorded.")
+        else:
+            if st.button(f"View submission ({e['title']})", key=f"view_{e['exam_id']}"):
+                st.session_state.active_exam_id = e["exam_id"]
+                _goto("submitted")
+    if auto and not any(exam_state(e) == "upcoming" for e in exam_list):
+        st.rerun()  # nothing is waiting to open any more: redraw the whole page, stop the timer
+
 def show_student_course_detail() -> None:
     """A course's two tabs: Exams + Labs."""
     def _content():
@@ -2556,79 +2659,12 @@ def show_student_course_detail() -> None:
             _goto("courses")
         t1, t2 = st.tabs(["📝 Exams", "🧪 Labs"])
         with t1:
-            _finalize_expired(dm, username=st.session_state.username)
-            exam_list = dm.get_exams(faculty_username=fac["username"])
-            if not exam_list:
-                _empty("📝", "No exams yet", "Your instructor hasn't published any exams for this course.", dark=True)
-            for e in exam_list:
-                sub = dm.get_exam_submission(st.session_state.username, e["exam_id"])
-                draft = None if sub else dm.get_draft(st.session_state.username, e["exam_id"])
-                state = exam_state(e)
-                opens, closes = exam_window(e)
-                if sub:
-                    status, badge = "Submitted", "badge-active"
-                elif draft:
-                    status, badge = "In progress", "badge-warning"
-                elif state == "open":
-                    status, badge = "Open", "badge-active"
-                elif state == "upcoming":
-                    status, badge = "Upcoming", "badge-upcoming"
-                else:
-                    status, badge = "Closed", "badge-ended"
-                st.markdown(
-                    f'<div class="tp-card-dark">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">'
-                    f'<div style="display:flex;align-items:center;gap:12px;min-width:0;">'
-                    f'<div class="m-icon" style="background:rgba(91,94,244,0.14);color:#a5b4fc;'
-                    f'width:38px;height:38px;border-radius:11px;font-size:16px;flex-shrink:0;'
-                    f'display:flex;align-items:center;justify-content:center;">📝</div>'
-                    f'<div><b style="color:white;">{e["title"]}</b>'
-                    f'<div style="color:#94a3b8;font-size:12px;margin-top:3px;">'
-                    f'{e["date"]} {e.get("start_time","")} · '
-                    f'{e["duration_mins"]} min · {len(e["questions"])} questions</div></div></div>'
-                    f'<span class="badge {badge}" style="flex-shrink:0;">{status.upper()}</span>'
-                    f'</div></div>',
-                    unsafe_allow_html=True,
-                )
-                fmt = "%d %b %H:%M"
-                if draft:
-                    if st.button(f"Resume exam: {e['title']}", key=f"resume_{e['exam_id']}", type="primary"):
-                        st.session_state.active_exam_id = e["exam_id"]
-                        st.session_state.exam_answers = dict(draft["answers"])
-                        st.session_state.session_id = draft["session_id"]
-                        st.session_state.exam_start_time = draft["started_at"]
-                        st.session_state.exam_deadline = draft["deadline"]
-                        st.session_state.auth_log = dm.get_auth_log(
-                            st.session_state.username, draft["session_id"])
-                        st.session_state.cp_log = dm.get_cp_log(
-                            st.session_state.username, draft["session_id"])
-                        st.session_state.consecutive_fails = 0
-                        st.session_state.exam_verified = True  # identity was verified at login
-                        st.session_state.exam_submitted = False
-                        _goto("exam_portal")
-                elif not sub and state == "open":
-                    st.caption(f"Open until {datetime.fromtimestamp(closes).strftime(fmt)} · "
-                               f"you get {e['duration_mins']} min once you start.")
-                    if st.button(f"Start exam: {e['title']}", key=f"start_{e['exam_id']}", type="primary"):
-                        st.session_state.active_exam_id = e["exam_id"]
-                        st.session_state.exam_answers = {}
-                        st.session_state.auth_log = []
-                        st.session_state.cp_log = []
-                        st.session_state.session_id = uuid.uuid4().hex
-                        st.session_state.consecutive_fails = 0
-                        st.session_state.exam_verified = False
-                        st.session_state._verify_attempts = 0
-                        st.session_state.exam_submitted = False
-                        st.session_state.exam_deadline = None
-                        _goto("exam_verify")
-                elif not sub and state == "upcoming":
-                    st.caption(f"🔒 Opens {datetime.fromtimestamp(opens).strftime(fmt)}.")
-                elif not sub:
-                    st.caption("⛔ This exam is closed and no submission was recorded.")
-                else:
-                    if st.button(f"View submission ({e['title']})", key=f"view_{e['exam_id']}"):
-                        st.session_state.active_exam_id = e["exam_id"]
-                        _goto("submitted")
+            exams_now = dm.get_exams(faculty_username=fac["username"])
+            if any(exam_state(e) == "upcoming" for e in exams_now):
+                st.fragment(run_every=EXAM_REFRESH_S)(_student_exam_list)(
+                    st.session_state.username, fac["username"], True)
+            else:
+                _student_exam_list(st.session_state.username, fac["username"])
         with t2:
             lab_list = dm.get_labs(faculty_username=fac["username"])
             if not lab_list:

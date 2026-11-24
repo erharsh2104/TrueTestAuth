@@ -275,6 +275,8 @@ gantt
 
 Student C tries at 11:05 and is turned away because the window has closed.
 
+A student waiting on the course page sees an "opens in ..." countdown, and the exam list re-checks the clock every 5 seconds (a Streamlit fragment), so the exam flips from Upcoming to Open and the **Start exam** button appears by itself, without a refresh or a click.
+
 ### Leaving the exam tab
 
 Faculty choose, per exam, a **tab-leave limit** (default 2 for new exams; 0 turns the rule off, which is also how exams created before this feature behave) and whether **fullscreen** is required (Exam Management → Create exam, or Reschedule on an existing exam).
