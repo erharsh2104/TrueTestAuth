@@ -23,8 +23,14 @@ import numpy as np
 
 # Suppress TF info/warnings before import
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-from tensorflow import keras  # noqa: E402
-from tensorflow.keras import layers  # noqa: E402
+try:
+    from tensorflow import keras  # noqa: E402
+    from tensorflow.keras import layers  # noqa: E402
+
+    HAS_TF = True
+except ImportError:  # TensorFlow is optional: without it only the LSTM is skipped
+    keras = layers = None  # type: ignore[assignment]
+    HAS_TF = False
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -268,8 +274,9 @@ class BehavioralAuthModel:
         for user, rows in by_user.items():
             self.set_profile(user, rows)
         metrics: Dict[str, float] = {"n_profiles": float(len(self.profiles))}
-        if len(by_user) < 2:
-            # A single user can still be verified by their profile alone.
+        if len(by_user) < 2 or not HAS_TF:
+            # A single user (or a machine without TensorFlow) is verified by
+            # their profile alone; the LSTM is only an optional extra.
             self.model, self.classes_ = None, []
             return metrics
 
@@ -378,12 +385,17 @@ class BehavioralAuthModel:
         if os.path.exists(prof_path):
             with open(prof_path, "r") as f:
                 obj.profiles = json.load(f)
-        if os.path.exists(meta_path) and os.path.exists(model_path):
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            obj.classes_ = meta["classes_"]
-            obj._mean = np.array(meta["mean"], dtype=np.float32) if meta["mean"] is not None else None
-            obj._std = np.array(meta["std"], dtype=np.float32) if meta["std"] is not None else None
-            obj.model = keras.models.load_model(model_path)
+        if HAS_TF and os.path.exists(meta_path) and os.path.exists(model_path):
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                model = keras.models.load_model(model_path)
+                obj.classes_ = meta["classes_"]
+                obj._mean = np.array(meta["mean"], dtype=np.float32) if meta["mean"] is not None else None
+                obj._std = np.array(meta["std"], dtype=np.float32) if meta["std"] is not None else None
+                obj.model = model
+            except Exception:
+                # Unreadable / incompatible LSTM file: fall back to profiles only.
+                obj.model, obj.classes_, obj._mean, obj._std = None, [], None, None
         obj.is_trained = bool(obj.profiles) or obj.model is not None
         return obj
