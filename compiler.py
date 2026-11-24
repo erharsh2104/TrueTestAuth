@@ -1,12 +1,19 @@
-"""C++ compiler facade — Judge0 → Piston → local g++ fallback.
+"""C++ compiler facade — local g++ → Judge0 (→ Piston, if you host one).
+
+LOCAL g++: install MinGW (Windows) or `apt install g++` / `brew install gcc`.
 
 JUDGE0 SETUP (free):
   1. https://rapidapi.com/judge0-official/api/judge0-ce  → subscribe to Basic
   2. Set env var JUDGE0_API_KEY=your_key  (or place it in a .env file)
-  3. Without a key the engine is silently skipped → Piston is used.
+  3. Without a key the engine is silently skipped.
 
-PISTON: no setup; endpoint https://emkc.org/api/v2/piston/execute
-LOCAL g++: install MinGW (Windows) or `apt install g++` / `brew install gcc`.
+PISTON (opt-in): the public server (emkc.org) has been whitelist-only since
+2026-02-15 and rejects every request, so Piston is NOT used by default. To use
+your own instance, set PISTON_URL, e.g. http://localhost:2000/api/v2/execute
+
+An engine is only skipped when the engine *itself* fails (network error, HTTP
+error, ...). If the student's program ran — even if it crashed, printed nothing
+or timed out — that result is returned as-is and no other engine is tried.
 """
 
 from __future__ import annotations
@@ -43,7 +50,6 @@ logger = logging.getLogger(__name__)
 JUDGE0_URL = "https://judge0-ce.p.rapidapi.com/submissions"
 JUDGE0_HOST = "judge0-ce.p.rapidapi.com"
 JUDGE0_CPP17_ID = 54
-PISTON_URL = "https://emkc.org/api/v2/piston/execute"
 PISTON_CPP_VERSION = "10.2.0"
 
 ENGINE_JUDGE0 = "Judge0"
@@ -66,6 +72,9 @@ class CompileResult:
     engine_used: str
     time_ms: int
     success: bool
+    # True when the *engine* failed (network/HTTP error, ...) and the student's
+    # program never actually ran; False for any real run, crash or timeout.
+    engine_error: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialise to a JSON-safe plain dict."""
@@ -77,6 +86,7 @@ class CompileResult:
             "engine_used": self.engine_used,
             "time_ms": self.time_ms,
             "success": self.success,
+            "engine_error": self.engine_error,
         }
 
 
@@ -101,8 +111,34 @@ def _limit_resources(timeout: int, memory_mb: int):
 
 
 def _empty(engine: str, msg: str) -> CompileResult:
-    """Quick constructor for an error CompileResult on a given engine."""
-    return CompileResult("", msg, "", -1, engine, 0, False)
+    """An engine-level failure: the program did not run on this engine."""
+    return CompileResult("", msg, "", -1, engine, 0, False, engine_error=True)
+
+
+# Windows NTSTATUS exit codes (and POSIX signals) a crashing C++ program ends with.
+_CRASH_NAMES = {
+    0xC0000005: "access violation (invalid memory access / segmentation fault)",
+    0xC00000FD: "stack overflow (infinite or too-deep recursion)",
+    0xC0000094: "integer division by zero",
+    0xC0000374: "heap corruption",
+    0xC000001D: "illegal instruction",
+    # NB: no entry for exit code 3 — MinGW's abort() uses it, but so can a
+    # deliberate `return 3;`, so it must not be reported as a crash.
+    -6: "aborted (SIGABRT)",
+    -8: "arithmetic error (SIGFPE)",
+    -11: "segmentation fault (SIGSEGV)",
+}
+
+
+def _describe_exit(code: int) -> str:
+    """A readable runtime-error line for a non-zero exit code with no output."""
+    big = code > 0xFFFF  # Windows reports NTSTATUS crashes as large unsigned numbers
+    key = code & 0xFFFFFFFF if big else code
+    shown = f"{key:#x}" if big else str(code)
+    name = _CRASH_NAMES.get(key)
+    if name is None:
+        return f"The program exited with code {shown}."
+    return f"Runtime error: {name} (exit code {shown})."
 
 
 class CppCompiler:
@@ -112,6 +148,8 @@ class CppCompiler:
         """Pick judge0/piston/local order; cache available paths once."""
         self.prefer_local = prefer_local
         self.judge0_key = os.environ.get("JUDGE0_API_KEY", "").strip()
+        # Piston is opt-in: the public server rejects everyone (see module docs).
+        self.piston_url = os.environ.get("PISTON_URL", "").strip()
         self._gcc_path = shutil.which("g++") or shutil.which("clang++")
 
     # ── Public API ──────────────────────────────────────────────────────────
@@ -143,18 +181,25 @@ class CppCompiler:
                 continue
             if res is None:
                 continue
-            if res.success or res.compile_error or res.stdout or res.stderr:
-                return res.to_dict()
-            last = res
+            if res.engine_error:
+                last = res  # the engine itself failed: try the next one
+                continue
+            # The program really ran (success, wrong output, crash, timeout, compile
+            # error ...). That is the answer; never re-run it on another engine.
+            return res.to_dict()
         if last is not None:
             return last.to_dict()
-        return _empty(ENGINE_NONE, "No compilation engine available.").to_dict()
+        return _empty(
+            ENGINE_NONE,
+            "No compilation engine available. Install g++ on the server "
+            "(or set JUDGE0_API_KEY).",
+        ).to_dict()
 
     def available_engines(self) -> Dict[str, bool]:
         """Return which engines are usable in this environment."""
         return {
             ENGINE_JUDGE0: bool(self.judge0_key) and requests is not None,
-            ENGINE_PISTON: requests is not None,
+            ENGINE_PISTON: bool(self.piston_url) and requests is not None,
             ENGINE_LOCAL: bool(self._gcc_path),
         }
 
@@ -171,7 +216,7 @@ class CppCompiler:
             for e in base
             if (e == ENGINE_LOCAL and self._gcc_path)
             or (e == ENGINE_JUDGE0 and self.judge0_key and requests is not None)
-            or (e == ENGINE_PISTON and requests is not None)
+            or (e == ENGINE_PISTON and self.piston_url and requests is not None)
         ]
 
     # ── Judge0 ──────────────────────────────────────────────────────────────
@@ -216,8 +261,8 @@ class CppCompiler:
 
     # ── Piston ──────────────────────────────────────────────────────────────
     def _piston(self, code: str, stdin: str, timeout: int) -> Optional[CompileResult]:
-        """Hit Piston API once and parse its compile + run blocks."""
-        if requests is None:
+        """Hit a (self-hosted) Piston API once and parse its compile + run blocks."""
+        if requests is None or not self.piston_url:
             return None
         body = {
             "language": "cpp",
@@ -228,7 +273,7 @@ class CppCompiler:
             "compile_timeout": 10000,
         }
         start = time.time()
-        r = requests.post(PISTON_URL, json=body, timeout=20)
+        r = requests.post(self.piston_url, json=body, timeout=20)
         if r.status_code >= 400:
             return _empty(ENGINE_PISTON, f"HTTP {r.status_code}: {r.text[:160]}")
         data = r.json()
@@ -299,8 +344,12 @@ class CppCompiler:
                     "", f"Time limit exceeded ({timeout}s).", "",
                     124, ENGINE_LOCAL, timeout * 1000, False,
                 )
+            stderr = run.stderr[:MAX_OUTPUT_CHARS]
+            if run.returncode != 0 and not stderr.strip():
+                # A crash (segfault, abort, ...) prints nothing; say what happened.
+                stderr = _describe_exit(run.returncode)
             return CompileResult(
-                run.stdout[:MAX_OUTPUT_CHARS], run.stderr[:MAX_OUTPUT_CHARS], "",
+                run.stdout[:MAX_OUTPUT_CHARS], stderr, "",
                 run.returncode, ENGINE_LOCAL,
                 int((time.time() - start) * 1000),
                 run.returncode == 0,
@@ -340,6 +389,36 @@ def _judge0_normalize(data: Dict[str, Any], elapsed_ms: int) -> CompileResult:
 
 
 # ── Test-case grading ────────────────────────────────────────────────────────
+def _verdict(run: Dict[str, Any]) -> str:
+    """Why a test failed, in words that reveal nothing about the hidden test."""
+    if run.get("engine_error"):
+        return "Grader unavailable"
+    if run.get("exit_code") == 124 or "time limit" in (run.get("stderr") or "").lower():
+        return "Time limit exceeded"
+    if run.get("exit_code") not in (0, None):
+        return "Runtime error"
+    return "Wrong answer"
+
+
+def student_view(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per-test results that are safe to send to a student's browser.
+
+    The full results (hidden input, expected output, program output) stay in the
+    database for faculty; students only get the verdict and the points.
+    """
+    return [
+        {
+            "status": r.get("status", "fail"),
+            "verdict": r.get("verdict") or ("Accepted" if r.get("status") == "pass" else "Wrong answer"),
+            "points": r.get("points", 0),
+            "awarded": r.get("awarded", 0),
+            "time_ms": r.get("time_ms", 0),
+        }
+        for r in results
+    ]
+
+
+
 def grade_submission(
     compiler: CppCompiler,
     code: str,
@@ -371,6 +450,7 @@ def grade_submission(
                     "points": points,
                     "awarded": 0,
                     "status": "compile_error",
+                    "verdict": "Compile error",
                     "stderr": run["compile_error"],
                     "time_ms": run.get("time_ms", 0),
                 }
@@ -389,6 +469,7 @@ def grade_submission(
                 "points": points,
                 "awarded": points if passed else 0,
                 "status": "pass" if passed else "fail",
+                "verdict": "Accepted" if passed else _verdict(run),
                 "stderr": run.get("stderr", ""),
                 "time_ms": run.get("time_ms", 0),
             }
