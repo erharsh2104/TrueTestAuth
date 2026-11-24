@@ -38,7 +38,7 @@ Faculty build exams, enroll students and review scores with typing-confidence hi
 | | |
 | --- | --- |
 | Roles | Faculty, Student |
-| Database | One SQLite file, 12 tables |
+| Database | One SQLite file, 15 tables |
 | Code | about 5,200 lines of Python, about 1,000 lines of browser code (non-blank) |
 | Typing features | 13 per sample |
 | Exam types | MCQ (auto-graded) and descriptive (stored for manual marking) |
@@ -66,6 +66,7 @@ These ratings are a judgement from reading the code.
 - **Behavioral enrollment and authentication.** Students type a fixed phrase 10 times at registration; a per-user profile is built from the 13 typing features.
 - **Continuous verification** during exams and labs, with a confidence status (Verified, Warning, Flagged) logged each time.
 - **Copy, paste, cut, context-menu and drag-and-drop blocking** in the assessment editors; paste attempts are logged.
+- **Leave-the-exam detection.** Switching tab, minimising the browser, clicking another window or (optionally) leaving fullscreen is recorded. The first time is a warning; the 2nd time the exam is submitted automatically with the answers written so far. Faculty set the limit per exam and can reopen after a false alarm. See [Leaving the exam tab](#leaving-the-exam-tab).
 - **Exam window.** Each exam opens at its date and start time and stays open for a window; faculty can reschedule it at any time.
 - **Saved answers and Resume.** Answers are stored as drafts while students work. A refresh or crash shows **Resume** with the original deadline, and attempts whose time ran out are submitted and graded automatically.
 - **MCQ auto-grading** against the faculty's answer key, with scores shown to students (per-question right or wrong) and to faculty (score out of total, chosen vs correct).
@@ -83,7 +84,7 @@ These ratings are a judgement from reading the code.
 | Application | Python 3.11, Streamlit, Pandas, NumPy, Requests, python-dotenv, pdfplumber |
 | Machine learning | TensorFlow CPU, Keras LSTM, manual z-score normalization |
 | Frontend | HTML, CSS, JavaScript, Streamlit custom component protocol |
-| C++ execution | Local `g++` or `clang++`, Piston API, Judge0 API |
+| C++ execution | Local `g++` or `clang++`; optional Judge0 API or self-hosted Piston |
 | Persistence | SQLite (`data/truetestauth.db`) through Python's built-in `sqlite3` |
 
 ---
@@ -105,9 +106,9 @@ flowchart LR
         S[Student pages]
         E[Exam rules<br/>window, drafts, grading]
     end
-    DM[(DataManager<br/>SQLite, 12 tables)]
+    DM[(DataManager<br/>SQLite, 15 tables)]
     M[BehavioralAuthModel<br/>profile 0.75 + LSTM 0.25]
-    C[CppCompiler<br/>local g++ → Piston → Judge0]
+    C[CppCompiler<br/>local g++ → Judge0 / own Piston]
 
     P <-->|rerun| R
     W -->|events JSON| D
@@ -129,7 +130,6 @@ flowchart LR
 | [`compiler.py`](compiler.py) | 368 | C++ execution through three engines, hidden-test grading |
 | [`ml_model.py`](ml_model.py) | 336 | Feature extraction, per-user profile score, LSTM, persistence |
 | [`seed_demo.py`](seed_demo.py) | 262 | Demo faculty, students, exam, lab and starter model |
-| [`future_scope/llm_quiz.py`](future_scope/llm_quiz.py) | 303 | Parked AI quiz generator, see [Roadmap](#roadmap-and-future-scope) |
 
 Line counts are non-blank lines.
 
@@ -139,15 +139,16 @@ Line counts are non-blank lines.
 
 | Role | Pages | What they do |
 | --- | --- | --- |
-| Faculty | Overview | Metrics, recent activity, integrity alerts (24 h) |
+| Faculty | Overview | Metrics, recent activity, integrity alerts (24 h): low-confidence flags and students who hit an attempt limit |
 | | Exam Management | Create exams (with PDF text extraction), see Active exams with live status and **Reschedule**, review Submissions |
 | | Code Lab | Create labs and problems, review lab submissions |
 | | Students | Pick from registered students to **enroll**, or remove them from the course |
 | | Reports | Per-student confidence timeline, per-exam summary, academic history, CSV export |
-| | Settings | Course name, account, enrolled students |
+| | Settings | Course name, account, change password, enrolled students |
 | Student | Your Courses | Courses the faculty enrolled them in |
 | | Course page | Exams (Upcoming, Open, In progress, Submitted, Closed) and Labs |
 | | Identity gate | Phrase check before an exam starts |
+| | Account | **Password** button on the course pages: change your password (at least 8 characters, current password required) |
 | | Exam portal | Timer, question navigator, live confidence gauge |
 | | Lab portal | Problem statement, C++ editor, run and submit |
 | | Result | Score, per-question result, integrity grade, paste count |
@@ -184,7 +185,7 @@ sequenceDiagram
     A-->>S: Score and per-question result
 ```
 
-**Registration steps:** account details, 10 phrase samples, profile creation. **Login:** password, then the typing phrase; the login is accepted at confidence `>= 0.45` (3 attempts per login).
+**Registration steps:** account details, 10 phrase samples, profile creation. **Login:** password, then the typing phrase; the login is accepted at confidence `>= 0.45` (3 failed typing checks lock the login for 15 minutes). Five wrong passwords for a username also lock that username for 15 minutes. The limits are stored in the database (`verify_attempts`), so a refresh, a new tab or restarting the exam does not reset them.
 
 ---
 
@@ -273,6 +274,24 @@ gantt
 ```
 
 Student C tries at 11:05 and is turned away because the window has closed.
+
+### Leaving the exam tab
+
+Faculty choose, per exam, a **tab-leave limit** (default 2 for new exams; 0 turns the rule off, which is also how exams created before this feature behave) and whether **fullscreen** is required (Exam Management → Create exam, or Reschedule on an existing exam).
+
+| Step | What happens |
+| --- | --- |
+| Before the exam | The identity gate shows the rules; the student must tick "I agree" before **Enter Exam** is enabled |
+| During the exam | One poll loop in the exam component checks every 0.5 s whether the page is hidden, the window lost focus (`window.parent.document.hasFocus()`), or fullscreen was exited |
+| Short glance | A leave shorter than **2 seconds** is forgiven |
+| 1st leave | Reported to the server (twice, 0.4 s apart; the server counts each episode once). A red warning "Warning 1 of 2" is shown |
+| 2nd leave | The server submits the saved answers at once, even if the student is still away, grades MCQs, and marks the submission "auto-submitted" |
+| Faculty view | Submissions table has a **Tab leaves** column; the drill-down lists each leave (time, kind, how long) and offers **Reopen for this student** |
+| Reopen | Removes the auto-submission, excuses the leaves (kept for the record), and restores the saved answers as a draft with the time that was left; the student sees **Resume exam** |
+
+The count lives in the database (`focus_events`), so a refresh or a second tab cannot reset it. Leaves also lower the integrity grade (1 leave: 70, 2 or more: 30, combined with the paste score by taking the worse). A heartbeat every 30 s lets faculty see if the exam page went silent for more than 3 minutes, which can mean a lost connection or a tampered page (`exam_monitor`).
+
+**What this can and cannot do.** A web page cannot stop a student from switching windows; it can only notice and react. It cannot see a second device, a phone or a second monitor that is never clicked. To truly lock the computer, run the exam in a lockdown browser such as Safe Exam Browser. The rule applies to exams only, not to code labs.
 
 ### States of one attempt
 
@@ -364,7 +383,7 @@ Average and minimum confidence, number of checks, flag count, a confidence timel
 
 ## C++ coding labs
 
-Faculty create labs with problems (difficulty, statement, time and memory limit, sample test, hidden tests with points, starter code). Students get an editor with **Run**, **Submit**, **Reset**, custom input, line numbers and behavioral monitoring.
+Faculty create labs with problems (difficulty, statement, time and memory limit, sample test, hidden tests with points, starter code). Students get an editor with **Run**, **Submit**, **Reset**, custom input, line numbers and behavioral monitoring. After **Submit**, students see a verdict and points for each hidden test (Accepted, Wrong answer, Runtime error, Time limit exceeded or Compile error) but never its input or expected output; those details are sent only to faculty.
 
 ```mermaid
 flowchart LR
@@ -381,8 +400,10 @@ flowchart LR
 `CppCompiler` is initialized with `prefer_local=True`, so engines are tried in this order until one works:
 
 1. **Local `g++` / `clang++`** with `-std=c++17 -O2 -pipe`.
-2. **Piston** (`https://emkc.org/api/v2/piston/execute`, C++ `10.2.0`).
+2. **Piston**, only if `PISTON_URL` points at your own instance. The public server (`emkc.org`) has been whitelist-only since 2026-02-15 and rejects every request, so it is no longer used.
 3. **Judge0** through RapidAPI (language ID `54`, polled by token). Skipped unless `JUDGE0_API_KEY` is set.
+
+A next engine is tried only when an engine itself fails (network or HTTP error). If the student's program ran, its result is final, even when it crashed, printed nothing or timed out, so it is never re-run elsewhere or sent to a third party. Crashes with no output are reported as a readable runtime error (for example "access violation" or "stack overflow").
 
 Each hidden test compiles the code again, which is simple but slow.
 
@@ -398,7 +419,7 @@ erDiagram
     users ||--o{ enrollments : "student / faculty"
     users ||--o{ exams : "faculty owns"
     users ||--o{ labs : "faculty owns"
-    users ||--o{ materials : "parked feature"
+    users ||--o{ materials : "reserved, unused"
     exams ||--o{ exam_drafts : "attempt in progress"
     exams ||--o{ exam_submissions : "final answers"
     exam_drafts }o--|| exam_submissions : "becomes"
@@ -497,7 +518,9 @@ Only key columns are drawn. A twelfth table, `meta`, records the one-time import
 | `exam_submissions` | Final answers, score, integrity result, average confidence, paste count |
 | `labs`, `lab_submissions` | Lab definitions and every attempt with per-test results |
 | `auth_logs`, `cp_logs` | Confidence timeline and copy/paste events per session |
-| `materials` | Slide decks for the parked quiz generator |
+| `focus_events`, `exam_monitor` | Each time a student left the exam tab (with an *excused* flag set when faculty reopen), and the longest silence of the exam page per attempt |
+| `verify_attempts` | Every password and identity-check attempt, used for the attempt limits and the faculty alerts; rows older than 7 days are removed |
+| `materials` | Reserved for lecture slide decks; nothing in the app uses it yet |
 
 **Migration:** if the database is empty and the old `data/*.json` files exist, they are imported once on start-up. Databases created before the exam window existed get the `window_mins` column added automatically. To inspect the data use `sqlite3 data/truetestauth.db` or any SQLite viewer.
 
@@ -572,10 +595,11 @@ pip install -r requirements.txt
 
 ### Environment variables
 
-Copy `.env.example` to `.env` only if you want Judge0:
+Copy `.env.example` to `.env` only if you want Judge0 or your own Piston server:
 
 ```text
 JUDGE0_API_KEY=your_judge0_api_key
+PISTON_URL=http://localhost:2000/api/v2/execute
 ```
 
 `MODEL_PATH` (optional) overrides the model directory (default `models/behavioral_auth_model_lstm`). No secret is included in this repository.
@@ -631,7 +655,6 @@ Each change in the latest release was exercised with scripted end-to-end checks:
 | MCQ form | Options appear on selecting MCQ; blank options rejected; saved exam holds options and key | Pass |
 | Scores | Student sees `3/9` with per-question results and no key; faculty table shows `3/9` | Pass |
 | Enrollment | No course picker; unenrolled students blocked; enroll selected, enroll all, remove; other faculty unaffected | Pass |
-| AI quiz generator | Slide extraction, topic grouping, validation and shuffling with a fake model | Parked, not tested against a live model |
 
 **These check scripts are not in the repository.** Moving them into a `tests/` folder is the cheapest way to keep these guarantees.
 
@@ -645,15 +668,16 @@ Each change in the latest release was exercised with scripted end-to-end checks:
 | Answers lost on refresh | Fixed | Saved as drafts; Resume and automatic submission |
 | MCQ options missing in the exam form | Fixed | The form no longer hides fields until submit |
 | Answer key sent to the browser | Fixed | Removed from the component payload |
-| Lockout after 3 failed typing checks | **Open** | The counters reset on the next login or exam start, so the lockout is only cosmetic. The message "the faculty has been notified" is not wired: blocked attempts are logged but the dashboard shows only Flagged |
+| Attempt limits and faculty alerts | **Fixed** | 5 wrong passwords, 3 failed typing checks at login and 3 failed identity checks per exam each lock for 15 minutes. Counters live in the database and the server ignores attempts while locked. Faculty see the student, the reason and whether the lock is still active on the Overview. A lock on a username can also be triggered by someone guessing it, which is the usual trade-off |
 | Student code runs unsandboxed | **Open** | Local g++ runs submitted programs as the server user |
 | User text rendered as HTML | **Open** | Names and titles go into `unsafe_allow_html` blocks without escaping |
 | LSTM trained on synthetic data | **Open** | 45 generated samples from 3 invented profiles; weight 0.25, skipped for free text |
 | Free-text thresholds uncalibrated | **Open** | No real free-text typing data in the project |
 | Lab form hidden-test count | **Open** | Same form pattern as the old exam form; raising the count probably needs a save first |
 | Countdown uses a deprecated API | **Open** | `components.html` works in Streamlit 1.65 but its announced removal date has passed |
-| Login is case-sensitive | **Open** | Registration lowercases usernames; the login form does not |
+| Login is case-sensitive | **Fixed** | `Alice_CS` now logs in as `alice_cs`; a case-insensitive match is used only when exactly one account fits |
 | Browser-side clipboard blocking | By design | Not a complete anti-cheating mechanism |
+| Leaving the exam tab | By design | Detected and recorded, not prevented; a second device is invisible. Needs testing in real browsers (Chrome, Edge, Firefox, Safari, phones) before relying on it. Fullscreen cannot be forced on iPhones; there the fullscreen rule is skipped |
 | Memory limits | By design | Enforced via `RLIMIT_AS` on Linux and macOS only (128 MB floor); not by Piston or Judge0 |
 | No public REST API | By design | The component events are internal, not HTTP endpoints |
 | No automated tests committed | **Open** | See [Verification](#verification) |
@@ -664,12 +688,10 @@ The database file and model directory are git-ignored, so a fresh clone must run
 
 ## Roadmap and future scope
 
-**AI quiz generation from lecture slides (parked).** Faculty would upload slides, choose syllabus topics, set the number of questions and total marks, review the generated answer key, and publish a quiz that students take like any other exam. A working pipeline using the free Gemini API is kept in [`future_scope/`](future_scope/README.md): slide extraction (PDF and PPTX), topic grouping, validated MCQ generation with shuffled options, and marks splitting. It was tested only against a fake model, so it needs a live test before it returns to the app.
-
-Other candidates, in rough order of value:
+Candidates, in rough order of value:
 
 1. Commit the check scripts as a `tests/` suite.
-2. Make failed-typing lockouts real and notify faculty.
+2. Add a faculty button to lift a lock early (locks currently expire after 15 minutes).
 3. Escape user text rendered as HTML.
 4. Sandbox C++ execution and compile once per submission instead of once per test.
 5. Collect real free-text typing data and calibrate the thresholds.
@@ -700,7 +722,6 @@ TrueTestAuth/
 ├── .streamlit/config.toml
 ├── experiments/                  CMU benchmark notebook, results, README
 ├── frontend/index.html           browser component
-├── future_scope/                 parked AI quiz generator + README
 ├── models/behavioral_auth_model_lstm/   profiles.json, lstm_model.keras, metadata.json
 ├── data/truetestauth.db          created on first run (git-ignored)
 ├── app.py

@@ -52,6 +52,16 @@ FEATURE_ORDER = [
     "rhythm_consistency", "total_time_ms", "n_keys",
 ]
 ENROLL_AFTER_SAMPLES = 10
+MIN_PASSWORD_LENGTH = 8  # enforced when changing / resetting a password
+
+# Attempt limits, stored in the database so a page refresh, a new tab or
+# restarting the exam cannot reset them: (failures allowed, window in seconds).
+# A lock lifts by itself once enough of the failures are older than the window.
+LOCKOUT_RULES: Dict[str, Tuple[int, int]] = {
+    "password": (5, 15 * 60),      # wrong username/password at the login form
+    "login_phrase": (3, 15 * 60),  # failed typing check right after login
+    "exam_gate": (3, 15 * 60),     # failed identity check before one exam (scope = exam_id)
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -92,7 +102,9 @@ CREATE TABLE IF NOT EXISTS exams (
     questions     TEXT NOT NULL,
     status        TEXT NOT NULL DEFAULT 'upcoming',
     created_at    REAL NOT NULL,
-    window_mins   INTEGER
+    window_mins   INTEGER,
+    max_leaves    INTEGER,
+    require_fullscreen INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_exams_faculty ON exams(faculty);
 
@@ -173,6 +185,39 @@ CREATE TABLE IF NOT EXISTS cp_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_cp_user_session ON cp_logs(username, session_id);
 
+CREATE TABLE IF NOT EXISTS focus_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    username   TEXT NOT NULL,
+    exam_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    episode    INTEGER NOT NULL,
+    away_ms    INTEGER NOT NULL DEFAULT 0,
+    excused    INTEGER NOT NULL DEFAULT 0,
+    timestamp  REAL NOT NULL,
+    UNIQUE (session_id, episode)
+);
+CREATE INDEX IF NOT EXISTS idx_focus_user_exam ON focus_events(username, exam_id);
+
+CREATE TABLE IF NOT EXISTS exam_monitor (
+    username  TEXT NOT NULL,
+    exam_id   TEXT NOT NULL,
+    last_beat REAL NOT NULL,
+    max_gap   REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (username, exam_id)
+);
+
+CREATE TABLE IF NOT EXISTS verify_attempts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    username   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    scope      TEXT NOT NULL DEFAULT '',
+    ok         INTEGER NOT NULL,
+    confidence REAL,
+    timestamp  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verify_lookup ON verify_attempts(username, kind, scope);
+
 CREATE TABLE IF NOT EXISTS materials (
     material_id TEXT PRIMARY KEY,
     faculty     TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -195,7 +240,7 @@ _CP_COLS = "username, session_id, event_type, question_id, chars, timestamp"
 _USER_UPDATABLE = {"password_hash", "full_name", "role", "course_name", "enrollment_no", "enrolled"}
 _EXAM_UPDATABLE = {
     "faculty", "title", "subject", "date", "start_time", "duration_mins",
-    "instructions", "questions", "status", "window_mins",
+    "instructions", "questions", "status", "window_mins", "max_leaves", "require_fullscreen",
 }
 
 
@@ -312,8 +357,9 @@ class DataManager:
             con.executescript(_SCHEMA)
             # Databases created before the exam window existed need the new column.
             cols = {r["name"] for r in con.execute("PRAGMA table_info(exams)")}
-            if "window_mins" not in cols:
-                con.execute("ALTER TABLE exams ADD COLUMN window_mins INTEGER")
+            for col in ("window_mins", "max_leaves", "require_fullscreen"):
+                if col not in cols:
+                    con.execute(f"ALTER TABLE exams ADD COLUMN {col} INTEGER")
         self._auto_import_legacy_json()
 
     @contextlib.contextmanager
@@ -377,7 +423,15 @@ class DataManager:
         with self._conn() as con:
             row = con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
             if not row:
+                # Usernames are stored lowercase by the sign-up forms, so accept
+                # "Alice_CS" for "alice_cs" (only when exactly one account fits).
+                matches = con.execute(
+                    "SELECT * FROM users WHERE lower(username) = lower(?)", (username,)
+                ).fetchall()
+                row = matches[0] if len(matches) == 1 else None
+            if not row:
                 return None
+            username = row["username"]  # canonical spelling for the rest of the login
             if not _verify(password, row["password_hash"]):
                 return None
             if row["role"] != role:
@@ -390,6 +444,34 @@ class DataManager:
                 )
                 row = con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
             return self._user_dict(con, row, with_samples=True)
+
+    def change_password(self, username: str, current: str, new: str) -> bool:
+        """Change a password after checking the current one (False if it is wrong)."""
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT password_hash FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if not row or not _verify(current, row["password_hash"]):
+                return False
+            con.execute(
+                "UPDATE users SET password_hash = ? WHERE username = ?",
+                (_hash(new), username),
+            )
+        return True
+
+    def reset_password(self, username: str, new_password: str) -> bool:
+        """Set a new password (admin use) and clear that account's attempt lock.
+
+        The app has no self-service reset; `reset_password.py` is the way to
+        recover an account. Returns False if the username does not exist.
+        """
+        if not self.update_user(username, {"password_hash": _hash(new_password)}):
+            return False
+        with self._conn() as con:
+            con.execute(
+                "DELETE FROM verify_attempts WHERE username = ?", (self._attempt_key(username),)
+            )
+        return True
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         with self._conn() as con:
@@ -564,16 +646,21 @@ class DataManager:
         questions: List[Dict],
         start_time: str = "10:00",
         window_mins: Optional[int] = None,
+        max_leaves: int = 0,
+        require_fullscreen: bool = False,
     ) -> str:
+        """`max_leaves`: leaving the exam tab this many times auto-submits (0 = off)."""
         eid = uuid.uuid4().hex[:8]
         with self._conn() as con:
             con.execute(
                 "INSERT INTO exams (exam_id, faculty, title, subject, date, start_time,"
-                " duration_mins, instructions, questions, status, created_at, window_mins)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'upcoming', ?, ?)",
+                " duration_mins, instructions, questions, status, created_at, window_mins,"
+                " max_leaves, require_fullscreen)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'upcoming', ?, ?, ?, ?)",
                 (eid, faculty_username, title, subject, date, start_time,
                  int(duration_mins), instructions, _dump(questions), time.time(),
-                 int(window_mins) if window_mins else None),
+                 int(window_mins) if window_mins else None,
+                 max(0, int(max_leaves)), int(bool(require_fullscreen))),
             )
         return eid
 
@@ -930,17 +1017,18 @@ class DataManager:
         for s in subs:
             log = self.get_auth_log(username, s["session_id"])
             cp = self.get_cp_log(username, s["session_id"])
-            avg = sum(a["confidence"] for a in log) / len(log) if log else 0.0
-            mn = min((a["confidence"] for a in log), default=0.0)
+            avg = sum(a["confidence"] for a in log) / len(log) if log else None
+            mn = min((a["confidence"] for a in log), default=None)
             exam = self.get_exam(s["exam_id"])
             out.append(
                 {
                     "Exam": exam["title"] if exam else s["exam_id"],
-                    "Avg confidence": f"{avg*100:.1f}%",
-                    "Min confidence": f"{mn*100:.1f}%",
+                    "Avg confidence": f"{avg*100:.1f}%" if log else "—",
+                    "Min confidence": f"{mn*100:.1f}%" if log else "—",
                     "Checks": len(log),
                     "Flags": sum(1 for a in log if a["status"] == "Flagged"),
                     "Pastes": len(cp),
+                    "Tab leaves": self.count_focus_leaves(username, s["exam_id"]),
                     "Integrity": (s.get("integrity") or {}).get("grade", "—"),
                 }
             )
@@ -1014,6 +1102,115 @@ class DataManager:
         with self._conn() as con:
             return [dict(r) for r in con.execute(sql, (faculty_username, cutoff)).fetchall()]
 
+    # ── Verification attempts: limits + faculty alerts ──────────────────────
+    @staticmethod
+    def _attempt_key(username: str) -> str:
+        """Normalise a typed username so 'Alice' and 'alice ' share one counter."""
+        return (username or "").strip().lower()[:64]
+
+    def record_attempt(
+        self, username: str, kind: str, ok: bool, scope: str = "",
+        confidence: Optional[float] = None,
+    ) -> None:
+        """Remember one password / typing-check attempt (a success resets the count)."""
+        if kind not in LOCKOUT_RULES:
+            raise ValueError(f"unknown attempt kind: {kind!r}")
+        now = time.time()
+        conf = float(confidence) if confidence is not None and confidence == confidence else None
+        with self._conn() as con:
+            con.execute(
+                "INSERT INTO verify_attempts (username, kind, scope, ok, confidence, timestamp)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (self._attempt_key(username), kind, scope or "", int(bool(ok)), conf, now),
+            )
+            con.execute("DELETE FROM verify_attempts WHERE timestamp < ?", (now - 7 * 86400,))
+
+    def lockout_state(self, username: str, kind: str, scope: str = "") -> Dict[str, Any]:
+        """Is this person locked out of `kind` right now?
+
+        Counts failures since the last success inside the sliding window. Once the
+        limit is reached the lock lasts until enough of those failures age out.
+        Returns {locked, fails, max_fails, remaining_s}.
+        """
+        max_fails, window = LOCKOUT_RULES[kind]
+        now = time.time()
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT ok, timestamp FROM verify_attempts"
+                " WHERE username = ? AND kind = ? AND scope = ? AND timestamp >= ?"
+                " ORDER BY id DESC",
+                (self._attempt_key(username), kind, scope or "", now - window),
+            ).fetchall()
+        fails: List[float] = []
+        for r in rows:  # newest first; stop at the most recent success
+            if r["ok"]:
+                break
+            fails.append(r["timestamp"])
+        locked = len(fails) >= max_fails
+        remaining = int(fails[max_fails - 1] + window - now) + 1 if locked else 0
+        return {
+            "locked": locked,
+            "fails": len(fails),
+            "max_fails": max_fails,
+            "remaining_s": max(0, remaining),
+        }
+
+    def get_verification_alerts(
+        self, faculty_username: str, hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """Students of this faculty who hit an attempt limit recently (newest first).
+
+        A single typo that was followed by a success is not an alert; only a run
+        of failures that reached the limit is.
+        """
+        since = time.time() - hours * 3600
+        sql = """
+            SELECT a.username, a.kind, a.scope, a.ok, a.confidence, a.timestamp,
+                   COALESCE(u.full_name, a.username) AS student_name
+            FROM verify_attempts a
+            JOIN enrollments e ON e.student = a.username AND e.faculty = ?
+            LEFT JOIN users u ON u.username = a.username
+            WHERE a.timestamp >= ?
+            ORDER BY a.id
+        """
+        with self._conn() as con:
+            rows = con.execute(sql, (faculty_username, since)).fetchall()
+            titles = {
+                r["exam_id"]: r["title"]
+                for r in con.execute(
+                    "SELECT exam_id, title FROM exams WHERE faculty = ?", (faculty_username,)
+                )
+            }
+        runs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        alerts: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for r in rows:
+            key = (r["username"], r["kind"], r["scope"])
+            if r["ok"]:
+                runs.pop(key, None)
+                continue
+            run = runs.setdefault(key, {"fails": 0, "min_conf": None})
+            run["fails"] += 1
+            if r["confidence"] is not None:
+                run["min_conf"] = (
+                    r["confidence"] if run["min_conf"] is None
+                    else min(run["min_conf"], r["confidence"])
+                )
+            if run["fails"] >= LOCKOUT_RULES[r["kind"]][0]:
+                alerts[key] = {
+                    "username": r["username"],
+                    "student_name": r["student_name"],
+                    "kind": r["kind"],
+                    "scope": r["scope"],
+                    "exam_title": titles.get(r["scope"], ""),
+                    "fails": run["fails"],
+                    "min_conf": run["min_conf"],
+                    "timestamp": r["timestamp"],
+                }
+        out = list(alerts.values())
+        for a in out:
+            a["locked_now"] = self.lockout_state(a["username"], a["kind"], a["scope"])["locked"]
+        return sorted(out, key=lambda a: a["timestamp"], reverse=True)
+
     # ── Copy-paste logs ─────────────────────────────────────────────────────
     def log_cp_event(
         self,
@@ -1038,16 +1235,145 @@ class DataManager:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # ── Leaving the exam tab (focus events) ─────────────────────────────────
+    def record_focus_event(
+        self, username: str, exam_id: str, session_id: str, kind: str,
+        episode: int, away_ms: int = 0,
+    ) -> Tuple[int, bool]:
+        """Store one "left the exam" episode. Returns (leaves counted so far, is_new).
+
+        An episode is reported twice by the browser for safety; the (session,
+        episode) pair is unique, so the repeat is ignored and counts once.
+        """
+        with self._conn() as con:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO focus_events"
+                " (username, exam_id, session_id, kind, episode, away_ms, timestamp)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (username, exam_id, session_id, kind, int(episode), int(away_ms), time.time()),
+            )
+            is_new = cur.rowcount > 0
+            n = con.execute(
+                "SELECT COUNT(*) FROM focus_events WHERE username = ? AND exam_id = ? AND excused = 0",
+                (username, exam_id),
+            ).fetchone()[0]
+        return n, is_new
+
+    def count_focus_leaves(self, username: str, exam_id: str) -> int:
+        """Leaves that count against this student (excused ones are not included)."""
+        with self._conn() as con:
+            return con.execute(
+                "SELECT COUNT(*) FROM focus_events WHERE username = ? AND exam_id = ? AND excused = 0",
+                (username, exam_id),
+            ).fetchone()[0]
+
+    def update_focus_away(self, username: str, exam_id: str, episode: int, away_ms: int) -> None:
+        """Record how long a leave actually lasted (sent when the student comes back)."""
+        with self._conn() as con:
+            con.execute(
+                "UPDATE focus_events SET away_ms = MAX(away_ms, ?)"
+                " WHERE username = ? AND exam_id = ? AND episode = ?",
+                (int(away_ms), username, exam_id, int(episode)),
+            )
+
+    def get_focus_events(self, username: str, exam_id: str) -> List[Dict[str, Any]]:
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT kind, away_ms, excused, timestamp FROM focus_events"
+                " WHERE username = ? AND exam_id = ? ORDER BY id",
+                (username, exam_id),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def beat(self, username: str, exam_id: str) -> None:
+        """Heartbeat from the exam page; remembers the longest silence between beats."""
+        now = time.time()
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT last_beat, max_gap FROM exam_monitor WHERE username = ? AND exam_id = ?",
+                (username, exam_id),
+            ).fetchone()
+            if row:
+                last, gap = row["last_beat"], row["max_gap"]
+            else:  # first beat: measure from when the attempt started
+                d = con.execute(
+                    "SELECT started_at FROM exam_drafts WHERE username = ? AND exam_id = ?",
+                    (username, exam_id),
+                ).fetchone()
+                last, gap = (d["started_at"] if d else now), 0.0
+            con.execute(
+                "INSERT OR REPLACE INTO exam_monitor (username, exam_id, last_beat, max_gap)"
+                " VALUES (?, ?, ?, ?)",
+                (username, exam_id, now, max(gap, now - last)),
+            )
+
+    def get_monitor_gap(self, username: str, exam_id: str, upto: float) -> float:
+        """Longest stretch (seconds) the exam page was silent, up to `upto`."""
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT last_beat, max_gap FROM exam_monitor WHERE username = ? AND exam_id = ?",
+                (username, exam_id),
+            ).fetchone()
+            if row:
+                return max(row["max_gap"], upto - row["last_beat"])
+            d = con.execute(
+                "SELECT started_at FROM exam_drafts WHERE username = ? AND exam_id = ?",
+                (username, exam_id),
+            ).fetchone()
+            return max(0.0, upto - d["started_at"]) if d else 0.0
+
+    def reopen_attempt(self, username: str, exam_id: str, remaining_s: int) -> bool:
+        """Undo an automatic submission (false alarm): the student resumes where they stopped.
+
+        Their saved answers become a draft again with `remaining_s` seconds left, the
+        submission is removed, and the earlier leaves are marked excused (kept for the
+        record, no longer counted).
+        """
+        exam = self.get_exam(exam_id)
+        sub = self.get_exam_submission(username, exam_id)
+        if not exam or not sub:
+            return False
+        now = time.time()
+        deadline = now + max(60, int(remaining_s))
+        with self._conn() as con:
+            con.execute("DELETE FROM exam_submissions WHERE username = ? AND exam_id = ?",
+                        (username, exam_id))
+            con.execute(
+                "INSERT OR REPLACE INTO exam_drafts (username, exam_id, session_id, answers,"
+                " started_at, deadline, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (username, exam_id, sub["session_id"], _dump(sub["answers"]),
+                 deadline - int(exam["duration_mins"]) * 60, deadline, now),
+            )
+            con.execute("UPDATE focus_events SET excused = 1 WHERE username = ? AND exam_id = ?",
+                        (username, exam_id))
+            con.execute("DELETE FROM exam_monitor WHERE username = ? AND exam_id = ?",
+                        (username, exam_id))
+        return True
+
     # ── Integrity score ─────────────────────────────────────────────────────
     @staticmethod
     def calculate_integrity_score(
-        avg_confidence: float, paste_count: int
+        avg_confidence: Optional[float], paste_count: int, leaves: int = 0
     ) -> Dict[str, Any]:
-        behavioral_score = max(0.0, min(100.0, avg_confidence * 100))
+        """Grade an attempt from its typing confidence and paste attempts.
+
+        `avg_confidence=None` means no typing check ran (e.g. an MCQ-only exam,
+        where nothing is typed). That is *missing evidence*, not 0% confidence,
+        so the grade then rests on the paste and tab-leave record alone. `leaves` is
+        how many times the student left the exam tab or window.
+        """
         paste_penalty = {0: 100, 1: 80, 2: 55}.get(paste_count, 20 if paste_count else 100)
         if paste_count >= 3:
             paste_penalty = 20
-        integrity_score = behavioral_score * 0.6 + paste_penalty * 0.4
+        leave_penalty = 100 if leaves <= 0 else (70 if leaves == 1 else 30)
+        conduct = min(paste_penalty, leave_penalty)  # the worse of the two records
+        checked = avg_confidence is not None
+        if checked:
+            behavioral_score = max(0.0, min(100.0, avg_confidence * 100))
+            integrity_score = behavioral_score * 0.6 + conduct * 0.4
+        else:
+            behavioral_score = None
+            integrity_score = float(conduct)
         if integrity_score >= 70:
             grade = "High"
         elif integrity_score >= 40:
@@ -1057,8 +1383,11 @@ class DataManager:
         return {
             "behavioral_score": behavioral_score,
             "paste_penalty": paste_penalty,
+            "leaves": leaves,
+            "leave_penalty": leave_penalty,
             "integrity_score": integrity_score,
             "grade": grade,
+            "behavioral_checked": checked,
         }
 
     # ── One-time import of the old JSON files ───────────────────────────────

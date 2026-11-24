@@ -121,6 +121,7 @@ def seed_demo_exam(dm: DataManager) -> str:
         start_time="00:00",
         window_mins=60 * 24 * 30,       # stays open for 30 days
         duration_mins=60,
+        max_leaves=2,                   # leaving the exam tab twice auto-submits
         instructions=(
             "Answer all questions. Continuous behavioural verification is "
             "active. Copy-paste is disabled and any attempts will be logged."

@@ -9,11 +9,12 @@ Architecture:
       iframes can talk to Python without being blocked by the
       `allow-top-navigation` sandbox restriction.
   • Copy-paste blocking: preventDefault inside the same component.
-  • Compilation: CppCompiler (Judge0 → Piston → local g++ fallback).
+  • Compilation: CppCompiler (local g++ first; Judge0 / own Piston optional).
 """
 
 from __future__ import annotations
 
+import html
 import os
 import time
 import uuid
@@ -24,8 +25,10 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from compiler import CppCompiler, grade_submission
-from data_manager import DEFAULT_STARTER_CODE, DataManager, exam_state, exam_window
+from compiler import CppCompiler, grade_submission, student_view
+from data_manager import (
+    DEFAULT_STARTER_CODE, MIN_PASSWORD_LENGTH, DataManager, exam_state, exam_window,
+)
 from ml_model import AUTH_THRESHOLD, DEFAULT_MODEL_DIR, BehavioralAuthModel
 
 
@@ -34,6 +37,9 @@ PHRASE: str = "the quick brown fox jumps"
 ENROLL_TARGET: int = 10
 LOW_CONFIDENCE: float = 0.45
 AMBER_CONFIDENCE: float = 0.65
+LEAVE_GRACE_MS: int = 2000     # leaving the exam for less than this is forgiven
+FOCUS_CAUSES = {"tab_hidden", "focus_lost", "fullscreen_exit"}
+MONITOR_GAP_WARN_S: int = 180  # a silence from the exam page longer than this is shown to faculty
 
 ROOT_DIR: str = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH: str = DEFAULT_MODEL_DIR
@@ -441,6 +447,23 @@ def _ring(pct: float, label: str, color: str = "#5b5ef4", dark: bool = False) ->
     )
 
 
+def _ordinal(n: int) -> str:
+    return {1: "1st", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
+
+
+def _exam_leave_limit(exam: Dict[str, Any]) -> int:
+    """How many times leaving the exam tab auto-submits this exam (0 = rule is off)."""
+    try:
+        return max(0, int((exam or {}).get("max_leaves") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _minutes(seconds: float) -> int:
+    """Whole minutes to show for a lock countdown (never less than 1)."""
+    return max(1, -(-int(seconds) // 60))
+
+
 # ── Cached singletons ────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_data_manager() -> DataManager:
@@ -450,7 +473,7 @@ def get_data_manager() -> DataManager:
 
 @st.cache_resource(show_spinner=False)
 def get_compiler() -> CppCompiler:
-    """Return the process-wide CppCompiler — prefer local g++ since Piston API is dead."""
+    """Return the process-wide CppCompiler — prefer local g++ (the public Piston API no longer accepts requests)."""
     return CppCompiler(prefer_local=True)
 
 
@@ -627,6 +650,14 @@ def _handle_payload(payload: Optional[Dict[str, Any]]) -> bool:
         _handle_login_verify(dm, payload)
     elif kind == "reg_sample":
         _handle_reg_sample(dm, payload)
+    elif kind == "exam_focus_event":
+        _handle_focus_event(dm, payload)
+    elif kind == "exam_focus_return":
+        _handle_focus_return(dm, payload)
+        return False
+    elif kind == "exam_heartbeat":
+        _handle_heartbeat(dm)
+        return False
     elif kind == "lab_code_update":
         st.session_state.lab_code = payload.get("code", "")
         return False
@@ -653,21 +684,20 @@ def _handle_verify_phrase(dm: DataManager, payload: Dict[str, Any]) -> None:
     user = st.session_state.username
     if not feats or not user:
         return
+    exam_id = st.session_state.active_exam_id or ""
+    # The limit lives in the database, not in this browser session: ignore any
+    # attempt (even a forged request) while this student is locked for this exam.
+    if dm.lockout_state(user, "exam_gate", exam_id)["locked"]:
+        return
     res = load_model().predict(feats, user)
     st.session_state["_verify_confidence"] = res["confidence"]
+    dm.record_attempt(user, "exam_gate", res["decision"], scope=exam_id,
+                      confidence=res["confidence"])
     if res["decision"]:
         st.session_state.exam_verified = True
         st.session_state._verify_attempts = 0
     else:
-        st.session_state._verify_attempts += 1
-        if st.session_state._verify_attempts >= 3:
-            dm.log_auth_check(
-                user,
-                st.session_state.session_id or "verify",
-                res["confidence"],
-                "Blocked",
-                engine="phrase_verify",
-            )
+        st.session_state._verify_attempts += 1  # only used to refresh the typing box
 
 
 def _handle_exam_continuous(dm: DataManager, payload: Dict[str, Any]) -> None:
@@ -714,6 +744,76 @@ def _handle_cp_event(dm: DataManager, payload: Dict[str, Any]) -> None:
             "timestamp": time.time(),
         }
     )
+
+
+def _focus_context(dm: DataManager) -> Optional[tuple]:
+    """(username, exam) while an attempt with the leave rule is in progress, else None."""
+    user = st.session_state.username
+    eid = st.session_state.active_exam_id
+    if not (user and eid and st.session_state.session_id):
+        return None
+    exam = dm.get_exam(eid)
+    if not exam or _exam_leave_limit(exam) <= 0 or dm.get_draft(user, eid) is None:
+        return None
+    return user, exam
+
+
+def _handle_focus_event(dm: DataManager, payload: Dict[str, Any]) -> None:
+    """The student left the exam tab/window for longer than the grace period.
+
+    Counted in the database (so a refresh cannot reset it). The limit-th leave
+    submits the answers saved so far, even if the student is still away.
+    """
+    ctx = _focus_context(dm)
+    cause = payload.get("cause")
+    if not ctx or cause not in FOCUS_CAUSES:
+        return
+    user, exam = ctx
+    try:
+        episode = int(payload.get("episode"))
+        away_ms = max(0, int(payload.get("away_ms", 0)))
+    except (TypeError, ValueError):
+        return
+    if isinstance(payload.get("answers"), dict):  # keep what was typed up to now
+        _handle_exam_answer_update(dm, payload)
+    leaves, is_new = dm.record_focus_event(
+        user, exam["exam_id"], st.session_state.session_id, cause, episode, away_ms
+    )
+    if is_new and leaves >= _exam_leave_limit(exam):
+        _auto_submit_for_leaving(dm, exam)
+
+
+def _handle_focus_return(dm: DataManager, payload: Dict[str, Any]) -> None:
+    """The student is back: remember how long the leave really lasted."""
+    ctx = _focus_context(dm)
+    if not ctx:
+        return
+    try:
+        dm.update_focus_away(ctx[0], ctx[1]["exam_id"], int(payload["episode"]),
+                             int(payload["away_ms"]))
+    except (KeyError, TypeError, ValueError):
+        pass
+
+
+def _handle_heartbeat(dm: DataManager) -> None:
+    """The exam page is alive; used to spot long silences (tampering, lost connection)."""
+    ctx = _focus_context(dm)
+    if ctx:
+        dm.beat(ctx[0], ctx[1]["exam_id"])
+
+
+def _auto_submit_for_leaving(dm: DataManager, exam: Dict[str, Any]) -> None:
+    """Submit the answers written so far because the leave limit was reached."""
+    user = st.session_state.username
+    draft = dm.get_draft(user, exam["exam_id"])
+    remaining = max(0, int(draft["deadline"] - time.time())) if draft else 0
+    _save_submission(
+        dm, exam, user, st.session_state.session_id, st.session_state.exam_answers,
+        st.session_state.auth_log, st.session_state.cp_log,
+        extra={"auto_submitted": "left_exam", "remaining_s": remaining},
+    )
+    dm.delete_draft(user, exam["exam_id"])
+    st.session_state.exam_submitted = True
 
 
 def _handle_exam_answer_update(dm: DataManager, payload: Dict[str, Any]) -> None:
@@ -775,7 +875,9 @@ def _handle_lab_submit(dm: DataManager, payload: Dict[str, Any]) -> None:
     st.session_state.lab_code = code
     st.session_state.lab_last_result = {
         "kind": "submit",
-        "results": grading["results"],
+        # Hidden tests stay hidden: the browser gets verdicts and points only.
+        # (The full results, with inputs and expected outputs, went to the DB above.)
+        "results": student_view(grading["results"]),
         "score": grading["score"],
         "max_score": grading["max_score"],
         "passed": grading["passed"],
@@ -942,7 +1044,17 @@ def _render_login_form(role: str) -> None:
             unsafe_allow_html=True,
         )
     if submitted:
+        # Too many wrong passwords for this username (stored in the database, so a
+        # refresh or a new tab does not reset it). Same message whether or not the
+        # account exists, so it cannot be used to discover usernames.
+        lock = dm.lockout_state(username, "password")
+        if lock["locked"]:
+            st.session_state._login_error = (
+                f"Too many failed attempts. Try again in about {_minutes(lock['remaining_s'])} min."
+            )
+            st.rerun()
         user = dm.login_user(username.strip(), password, role)
+        dm.record_attempt(username, "password", bool(user))
         if not user:
             st.session_state._login_error = "Wrong username, password, or role."
             st.rerun()
@@ -983,29 +1095,34 @@ def _handle_login_verify(dm: DataManager, payload: Dict[str, Any]) -> None:
     feats = payload.get("features")
     if not feats or not user:
         return
+    if dm.lockout_state(user["username"], "login_phrase")["locked"]:
+        return  # locked in the database: ignore any attempt, even a forged request
     model = load_model()
     if not model.is_trained:
         _complete_student_login(user)  # no model yet: nothing to verify against
         return
     conf = model.predict(feats, user["username"]).get("confidence", 0.0)
     st.session_state._verify_login_confidence = conf
+    dm.record_attempt(user["username"], "login_phrase", conf >= AUTH_THRESHOLD,
+                      confidence=conf)
     if conf >= AUTH_THRESHOLD:
         _complete_student_login(user)
     else:
         st.session_state._verify_login_attempts = (
             st.session_state.get("_verify_login_attempts", 0) + 1
-        )
+        )  # only used to refresh the typing box
 
 
 def _render_login_verify_behavior() -> None:
     """Verify student identity by typing the behavioral phrase before login."""
     user = st.session_state.get("_pending_login") or {}
     attempts = st.session_state.get("_verify_login_attempts", 0)
+    lock = get_data_manager().lockout_state(user.get("username", ""), "login_phrase")
 
-    if attempts >= 3:
+    if lock["locked"]:
         st.markdown("<div style='text-align:center;font-size:36px;margin:8px 0;'>🚫</div>", unsafe_allow_html=True)
-        st.markdown("<div style='color:#fca5a5;text-align:center;font-size:15px;font-weight:600;margin-bottom:12px;'>Verification failed after 3 attempts</div>", unsafe_allow_html=True)
-        st.markdown("<div style='color:rgba(255,255,255,0.5);text-align:center;font-size:13px;margin-bottom:16px;'>Your typing pattern did not match. Please contact your faculty.</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='color:#fca5a5;text-align:center;font-size:15px;font-weight:600;margin-bottom:12px;'>Verification failed after {lock['max_fails']} attempts</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='color:rgba(255,255,255,0.5);text-align:center;font-size:13px;margin-bottom:16px;'>Your typing pattern did not match. Your instructor has been notified. Try again in about {_minutes(lock['remaining_s'])} min, or contact your instructor.</div>", unsafe_allow_html=True)
         if st.button("← Try different account", key="verify_back"):
             st.session_state._login_stage = "form"
             st.session_state._pending_login = None
@@ -1016,10 +1133,10 @@ def _render_login_verify_behavior() -> None:
     st.markdown("<div style='color:rgba(255,255,255,0.5);font-size:13px;margin-bottom:16px;'>Type the phrase below to verify your identity</div>", unsafe_allow_html=True)
     st.markdown(f"<div style='background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.3);border-radius:12px;padding:14px 18px;text-align:center;color:#c7d2fe;font-size:18px;font-weight:600;letter-spacing:0.04em;margin-bottom:12px;'>{PHRASE}</div>", unsafe_allow_html=True)
 
-    if attempts > 0:
+    if lock["fails"] > 0:
         conf = st.session_state.get("_verify_login_confidence")
         if conf is not None:
-            st.markdown(f"<div style='color:#fca5a5;font-size:13px;margin-bottom:8px;'>Confidence: {conf * 100:.0f}% — too low. {3 - attempts} attempts remaining.</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='color:#fca5a5;font-size:13px;margin-bottom:8px;'>Confidence: {conf * 100:.0f}% — too low. {lock['max_fails'] - lock['fails']} attempts remaining.</div>", unsafe_allow_html=True)
 
     payload = tp_widget(
         widget_type="phrase_capture",
@@ -1277,6 +1394,7 @@ def show_faculty_overview() -> None:
         exams = dm.get_exams(faculty_username=st.session_state.username)
         labs = dm.get_labs(faculty_username=st.session_state.username)
         flagged = dm.get_flagged_recent(faculty_username=st.session_state.username)
+        locked_out = dm.get_verification_alerts(faculty_username=st.session_state.username)
         recent = dm.get_recent_submissions(faculty_username=st.session_state.username, limit=8)
 
         _titles = {"dr.", "dr", "prof.", "prof", "mr.", "mrs.", "ms."}
@@ -1291,13 +1409,14 @@ def show_faculty_overview() -> None:
         )
 
         active_exam_ct = len([e for e in exams if e.get("status") != "ended"])
-        flag_accent = "red" if flagged else "green"
+        n_alerts = len(flagged) + len(locked_out)
+        flag_accent = "red" if n_alerts else "green"
         st.markdown(
             '<div class="metric-grid">'
             + _metric("🎓", "Students enrolled", str(len(students)), "indigo")
             + _metric("📝", "Active exams", str(active_exam_ct), "cyan")
             + _metric("🧪", "Active labs", str(len(labs)), "amber")
-            + _metric("🚩", "Flagged sessions (24h)", str(len(flagged)), flag_accent)
+            + _metric("🚩", "Integrity alerts (24h)", str(n_alerts), flag_accent)
             + "</div>",
             unsafe_allow_html=True,
         )
@@ -1335,10 +1454,29 @@ def show_faculty_overview() -> None:
                     'letter-spacing:normal">(24h)</span></div>',
                     unsafe_allow_html=True,
                 )
-                if not flagged:
+                if not flagged and not locked_out:
                     _empty("✅", "All clear", "No integrity flags in the last 24 hours.")
                 else:
                     rows = ""
+                    for a in locked_out:  # students who hit an attempt limit
+                        ts = pd.to_datetime(a["timestamp"], unit="s").strftime("%H:%M")
+                        what = {
+                            "password": "repeated wrong passwords",
+                            "login_phrase": "failed typing check at login",
+                            "exam_gate": "failed identity check"
+                            + (f" for “{html.escape(a['exam_title'])}”" if a["exam_title"] else ""),
+                        }[a["kind"]]
+                        state = "locked now" if a["locked_now"] else "lock expired"
+                        rows += (
+                            "<div class='feed-row'><div class='fr-left'>"
+                            "<div class='fr-dot' style='background:rgba(239,68,68,0.10)'>🔒</div>"
+                            "<div><span style='color:var(--text);font-weight:600;font-size:13.5px'>"
+                            f"{html.escape(str(a['student_name']))}</span>"
+                            f"<span style='color:#94a3b8;font-size:12px;margin-left:8px'>"
+                            f"{what} · {a['fails']}×</span></div></div>"
+                            f"<span style='color:#94a3b8;font-size:12px;white-space:nowrap'>"
+                            f"{state} · {ts}</span></div>"
+                        )
                     for f in flagged:
                         ts = pd.to_datetime(f["timestamp"], unit="s").strftime("%H:%M")
                         rows += (
@@ -1445,6 +1583,13 @@ def _faculty_create_exam_form() -> None:
             "Stays open for (min, 0 = same as duration)", 0, 10080, 0, key=f"ex_win_{g}",
             help="How long students can start the exam after it opens.",
         )
+        max_leaves = st.number_input(
+            "Tab-leave limit (0 = off)", 0, 10, 2, key=f"ex_leaves_{g}",
+            help="Leaving the exam tab or window this many times submits the exam "
+                 "automatically. The earlier leaves are warnings.",
+        )
+        req_fs = st.checkbox("Require fullscreen", value=False, key=f"ex_fs_{g}",
+                             help="Exiting fullscreen counts as leaving the exam.")
 
     st.markdown(f"##### Questions ({st.session_state._exam_q_count})")
     questions: List[Dict[str, Any]] = []
@@ -1513,6 +1658,8 @@ def _faculty_create_exam_form() -> None:
                 instructions=instructions,
                 questions=filled,
                 window_mins=int(window) or None,
+                max_leaves=int(max_leaves),
+                require_fullscreen=bool(req_fs),
             )
             st.session_state._exam_form_gen = g + 1
             st.session_state._exam_q_count = 5
@@ -1538,6 +1685,9 @@ def _faculty_active_exams() -> None:
             f"closes {datetime.fromtimestamp(closes):%d %b %H:%M}"
             if closes != float("inf") else "always open"
         )
+        if e.get("max_leaves"):
+            window_txt += (f" · tab-leave limit {int(e['max_leaves'])}"
+                           + (" · fullscreen" if e.get("require_fullscreen") else ""))
         st.markdown(
             f'<div class="tp-card">'
             f'<div style="display:flex;justify-content:space-between;align-items:center;gap:14px;">'
@@ -1566,12 +1716,20 @@ def _faculty_active_exams() -> None:
                     d0, t0 = date.today(), dtime(10, 0)
                 nd = r1.date_input("Date", value=d0)
                 nt = r2.time_input("Start time", value=t0)
-                nw = r3.number_input("Stays open (min, 0 = same as duration)", 0, 10080,
-                                     value=int(e.get("window_mins") or 0))
+                cur_win = int(e.get("window_mins") or 0)
+                # Never let the cap fall below the stored value (e.g. the seeded
+                # 30-day window), or Streamlit raises and the whole page crashes.
+                nw = r3.number_input("Stays open (min, 0 = same as duration)", 0,
+                                     max(10080, cur_win), value=cur_win)
+                r4, r5 = st.columns(2)
+                nl = r4.number_input("Tab-leave limit (0 = off)", 0, 10,
+                                     value=int(e.get("max_leaves") or 0))
+                nf = r5.checkbox("Require fullscreen", value=bool(e.get("require_fullscreen")))
                 if st.form_submit_button("Save schedule"):
                     dm.update_exam(e["exam_id"], {
                         "date": str(nd), "start_time": nt.strftime("%H:%M"),
                         "window_mins": int(nw) or None,
+                        "max_leaves": int(nl), "require_fullscreen": int(nf),
                     })
                     st.rerun()
 
@@ -1583,6 +1741,9 @@ def _faculty_exam_submissions() -> None:
     if not exams:
         _empty("🗂", "No exams to review yet", "Create an exam first, then submissions will appear here.")
         return
+    flash = st.session_state.pop("_reopen_msg", None)
+    if flash:
+        st.success(flash)
     eid_map = {e["exam_id"]: e["title"] for e in exams}
     eid = st.selectbox(
         "Pick an exam",
@@ -1601,10 +1762,12 @@ def _faculty_exam_submissions() -> None:
         u = dm.get_user(s["username"]) or {}
         auth_log = dm.get_auth_log(s["username"], s["session_id"])
         cp_log = dm.get_cp_log(s["username"], s["session_id"])
+        # No typing checks (e.g. MCQ-only exam) is missing evidence, not 0% confidence.
         avg_conf = (
-            sum(a["confidence"] for a in auth_log) / len(auth_log) if auth_log else 0.0
+            sum(a["confidence"] for a in auth_log) / len(auth_log) if auth_log else None
         )
-        integrity = dm.calculate_integrity_score(avg_conf, len(cp_log))
+        leaves = dm.count_focus_leaves(s["username"], s["exam_id"])
+        integrity = dm.calculate_integrity_score(avg_conf, len(cp_log), leaves)
         rows.append(
             {
                 "Student": u.get("full_name", s["username"]),
@@ -1613,6 +1776,8 @@ def _faculty_exam_submissions() -> None:
                     "%Y-%m-%d %H:%M"
                 ),
                 "Status": integrity["grade"],
+                "Typing checks": len(auth_log),
+                "Tab leaves": leaves,
                 "Integrity": f"{integrity['integrity_score']:.0f}%",
                 "Score": f"{s.get('score', 0)}/{mcq_total}" if mcq_total else s.get("score", ""),
                 "_username": s["username"],
@@ -1647,6 +1812,48 @@ def _faculty_exam_submissions() -> None:
     exam = dm.get_exam(eid)
     auth_log = dm.get_auth_log(row["_username"], row["_session_id"])
     cp_log = dm.get_cp_log(row["_username"], row["_session_id"])
+
+    sub_int = sub.get("integrity") or {}
+    focus = dm.get_focus_events(row["_username"], eid)
+    gap = int(sub_int.get("monitor_gap_s") or 0)
+    if focus or sub_int.get("auto_submitted") or gap > MONITOR_GAP_WARN_S:
+        st.markdown("**Leaving the exam tab**")
+        if sub_int.get("auto_submitted") == "left_exam":
+            st.warning(
+                "Submitted automatically: the student left the exam tab "
+                f"{sub_int.get('leaves', len(focus))} times. Answers up to that moment were saved."
+            )
+        if focus:
+            what = {"tab_hidden": "Switched tab / minimised the browser",
+                    "focus_lost": "Clicked another window or app",
+                    "fullscreen_exit": "Left fullscreen"}
+            st.dataframe(
+                pd.DataFrame([{
+                    "Time": time.strftime("%H:%M:%S", time.localtime(f["timestamp"])),
+                    "What happened": what.get(f["kind"], f["kind"]),
+                    "Away for": f"{f['away_ms'] / 1000:.0f} s",
+                    "Counted": "excused" if f["excused"] else "yes",
+                } for f in focus]),
+                width="stretch", hide_index=True,
+            )
+        if gap > MONITOR_GAP_WARN_S:
+            st.info(
+                f"The exam page stopped reporting for up to {gap // 60} min {gap % 60} s. "
+                "That can be a lost connection or the browser slowing a background tab, "
+                "but it can also mean the page was tampered with."
+            )
+        if sub_int.get("auto_submitted") == "left_exam":
+            st.caption(
+                "False alarm (power cut, system pop-up)? Reopening removes this submission, "
+                "excuses the leaves, and lets the student resume with their saved answers and "
+                f"the {int(sub_int.get('remaining_s') or 0) // 60} min they had left."
+            )
+            if st.button("↩ Reopen for this student", key=f"reopen_{eid}_{row['_username']}"):
+                dm.reopen_attempt(row["_username"], eid, int(sub_int.get("remaining_s") or 300))
+                st.session_state._reopen_msg = (
+                    f"Reopened for {row['Student']}. They will see “Resume exam”."
+                )
+                st.rerun()
 
     st.markdown(f"**Answers** — {row['Student']}")
     for q in exam["questions"]:
@@ -2142,6 +2349,42 @@ def show_faculty_students() -> None:
     _faculty_layout(_content)
 
 
+# ── Change password (shared by faculty Settings and the student Account page) ─
+def _render_change_password(form_key: str) -> None:
+    """Form to change the signed-in user's password (needs the current one)."""
+    dm = get_data_manager()
+    user = st.session_state.username
+    with st.form(form_key, clear_on_submit=True):
+        current = st.text_input("Current password", type="password")
+        new = st.text_input(f"New password (at least {MIN_PASSWORD_LENGTH} characters)",
+                            type="password")
+        confirm = st.text_input("Confirm new password", type="password")
+        go = st.form_submit_button("Change password", type="primary")
+    if not go:
+        return
+    # Guessing the current password at an unattended screen counts towards the same
+    # limit as the login form.
+    lock = dm.lockout_state(user, "password")
+    if lock["locked"]:
+        st.error(f"Too many failed attempts. Try again in about {_minutes(lock['remaining_s'])} min.")
+    elif not (current and new and confirm):
+        st.error("Fill in all three fields.")
+    elif len(new) < MIN_PASSWORD_LENGTH:
+        st.error(f"The new password must be at least {MIN_PASSWORD_LENGTH} characters.")
+    elif new != confirm:
+        st.error("The new password and its confirmation do not match.")
+    elif new == current:
+        st.error("The new password must be different from the current one.")
+    elif new.strip().lower() == user.lower():
+        st.error("The password must not be the same as your username.")
+    elif dm.change_password(user, current, new):
+        dm.record_attempt(user, "password", True)
+        st.success("Password changed. Use the new one next time you sign in.")
+    else:
+        dm.record_attempt(user, "password", False)
+        st.error("The current password is incorrect.")
+
+
 # ── Faculty: Settings ───────────────────────────────────────────────────────
 def show_faculty_settings() -> None:
     """Settings: change course name + view enrolled students."""
@@ -2184,6 +2427,14 @@ def show_faculty_settings() -> None:
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
         with _card():
             st.markdown(
+                '<div class="card-eyebrow"><span class="dot"></span>Change password</div>',
+                unsafe_allow_html=True,
+            )
+            _render_change_password("fac_pw_form")
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        with _card():
+            st.markdown(
                 '<div class="card-eyebrow"><span class="dot"></span>Enrolled students</div>',
                 unsafe_allow_html=True,
             )
@@ -2214,11 +2465,32 @@ def _student_layout(render) -> None:
     """Sticky navbar + padded content container with a logout action."""
     _ui_student_navbar()
     with st.container(key="stu_content"):
-        _, logout_col = st.columns([9, 1])
+        _, pw_col, logout_col = st.columns([8, 1.6, 1])
+        with pw_col:
+            # Not offered during an exam or lab, so nobody wanders off mid-attempt.
+            if st.session_state.page in ("courses", "course_detail"):
+                if st.button("🔑 Password", key="stu_pw_btn", width="stretch"):
+                    _goto("account")
         with logout_col:
             if st.button("Logout", key="stu_logout_top", width="stretch"):
                 _logout()
         render()
+
+
+def show_student_account() -> None:
+    """Student account page: change password."""
+    def _content():
+        st.markdown(
+            '<h1 class="tp-title-dark" style="margin-top:4px;">Account</h1>'
+            f'<p class="tp-sub-dark">{html.escape(str(st.session_state.full_name or ""))} · '
+            f'@{html.escape(str(st.session_state.username))}</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("##### Change password")
+        _render_change_password("stu_pw_form")
+        if st.button("← Back to courses", key="stu_acct_back"):
+            _goto("courses")
+    _student_layout(_content)
 
 
 # ── Student: Courses ─────────────────────────────────────────────────────────
@@ -2401,15 +2673,29 @@ def show_exam_verification() -> None:
             f'phrase below to confirm your typing pattern.</p>',
             unsafe_allow_html=True,
         )
+        limit = _exam_leave_limit(exam)
+        if limit:
+            st.warning(
+                "**Exam rules.** Stay on the exam tab for the whole exam. If you switch tabs, "
+                f"minimise the browser or click another window for more than {LEAVE_GRACE_MS // 1000} "
+                f"seconds, it is recorded and you get a warning. The {_ordinal(limit)} time, your "
+                "exam is submitted automatically with the answers you have written so far."
+                + (" This exam must be taken in fullscreen; leaving fullscreen counts the same way."
+                   if exam.get("require_fullscreen") else "")
+                + " Copying and pasting is blocked and logged."
+            )
         if exam and exam_state(exam) != "open":
             st.error("This exam is not open right now.")
             if st.button("← Back to course"):
                 _goto("course_detail")
             return
-        if st.session_state._verify_attempts >= 3:
+        gate = dm.lockout_state(st.session_state.username, "exam_gate",
+                                st.session_state.active_exam_id or "")
+        if gate["locked"]:
             st.error(
-                "Verification failed 3 times. The faculty has been notified. "
-                "You cannot start the exam from this device."
+                f"Verification failed {gate['max_fails']} times. Your instructor has been "
+                f"notified. You can try again in about {_minutes(gate['remaining_s'])} min, "
+                "or ask your instructor for help."
             )
             if st.button("← Back to course"):
                 _goto("course_detail")
@@ -2439,7 +2725,14 @@ def show_exam_verification() -> None:
             )
         if st.session_state.exam_verified:
             st.success("Verification passed.")
-            if st.button("Enter Exam →", type="primary"):
+            limit = _exam_leave_limit(exam)
+            agreed = True
+            if limit:
+                agreed = st.checkbox(
+                    "I have read the exam rules above and agree to them.",
+                    key=f"agree_{exam['exam_id']}",
+                )
+            if st.button("Enter Exam →", type="primary", disabled=not agreed):
                 now = time.time()
                 _, closes = exam_window(exam)
                 if now >= closes:
@@ -2454,9 +2747,9 @@ def show_exam_verification() -> None:
                 st.session_state.exam_deadline = draft["deadline"]
                 st.session_state.session_id = draft["session_id"]
                 _goto("exam_portal")
-        elif st.session_state._verify_attempts > 0:
+        elif gate["fails"] > 0:
             st.warning(
-                f"Try again — {3 - st.session_state._verify_attempts} attempts remaining."
+                f"Try again — {gate['max_fails'] - gate['fails']} attempts remaining."
             )
     _student_layout(_content)
 
@@ -2530,6 +2823,18 @@ def show_exam_portal() -> None:
             f'</span></div>',
             unsafe_allow_html=True,
         )
+        limit = _exam_leave_limit(exam)
+        leaves = dm.count_focus_leaves(st.session_state.username, exam["exam_id"]) if limit else 0
+        if limit and leaves:
+            st.error(
+                f"⚠ Warning {leaves} of {limit}: you left the exam tab or window. "
+                f"{max(0, limit - leaves)} more and your exam is submitted automatically."
+            )
+        elif limit:
+            st.info(
+                f"Stay on this tab. Leaving it for more than {LEAVE_GRACE_MS // 1000} seconds "
+                f"is recorded; the {_ordinal(limit)} time, your exam is submitted automatically."
+            )
         if remaining <= 0:
             _do_exam_submit(dm, exam)
             return
@@ -2549,6 +2854,11 @@ def show_exam_portal() -> None:
                 initial_answers=st.session_state.exam_answers,
                 check_interval_ms=30_000,
                 last_confidence=last_conf,
+                focus_watch=bool(limit),
+                grace_ms=LEAVE_GRACE_MS,
+                require_fullscreen=bool(limit and exam.get("require_fullscreen")),
+                leaves=leaves,
+                max_leaves=limit,
                 key=f"exam_session_{st.session_state.session_id}",
             )
             if _handle_payload(payload):
@@ -2621,7 +2931,10 @@ def show_exam_portal() -> None:
                             unsafe_allow_html=True,
                         )
         if st.session_state.consecutive_fails >= 2:
-            st.warning("Suspicious typing detected — re-verify on next check.")
+            st.warning(
+                "Your typing doesn't match your usual pattern. This has been recorded "
+                "and your instructor can see it."
+            )
 
     _student_layout(_content)
 
@@ -2643,11 +2956,20 @@ def _do_exam_submit(dm: DataManager, exam: Dict[str, Any]) -> None:
 def _save_submission(
     dm: DataManager, exam: Dict[str, Any], user: str, session_id: str,
     answers: Dict[str, str], auth_log: List[Dict], cp_log: List[Dict],
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Grade MCQs, compute integrity and store the final submission."""
+    # No typing checks (e.g. MCQ-only exam) is missing evidence, not 0% confidence.
     avg_conf = (
-        sum(a["confidence"] for a in auth_log) / len(auth_log) if auth_log else 0.0
+        sum(a["confidence"] for a in auth_log) / len(auth_log) if auth_log else None
     )
+    integrity = dm.calculate_integrity_score(
+        avg_conf, len(cp_log), dm.count_focus_leaves(user, exam["exam_id"])
+    )
+    if _exam_leave_limit(exam) > 0:
+        integrity["monitor_gap_s"] = round(dm.get_monitor_gap(user, exam["exam_id"], time.time()))
+    if extra:
+        integrity.update(extra)
     dm.save_exam_submission(
         username=user,
         exam_id=exam["exam_id"],
@@ -2656,7 +2978,7 @@ def _save_submission(
         auth_log=auth_log,
         cp_log=cp_log,
         score=_auto_grade_mcq(exam, answers),
-        integrity=dm.calculate_integrity_score(avg_conf, len(cp_log)),
+        integrity=integrity,
     )
 
 
@@ -2811,6 +3133,12 @@ def show_submission_success() -> None:
             unsafe_allow_html=True,
         )
         st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        if integrity.get("auto_submitted") == "left_exam":
+            st.warning(
+                f"Your exam was submitted automatically because you left the exam tab "
+                f"{integrity.get('leaves', '')} times. Your answers up to that moment were saved. "
+                "If this was a mistake, tell your instructor."
+            )
         score = integrity["integrity_score"]
         score_accent = "green" if score >= 70 else "amber" if score >= 40 else "red"
         mcqs = [q for q in exam.get("questions", []) if q.get("type") == "MCQ"]
@@ -2826,7 +3154,11 @@ def show_submission_success() -> None:
             unsafe_allow_html=True,
         )
         c[1].markdown(
-            _metric("🔐", "Avg Auth Confidence", f"{avg_conf*100:.0f}%", "indigo", dark=True),
+            _metric(
+                "🔐", "Avg Auth Confidence",
+                f"{avg_conf*100:.0f}%" if integrity.get("behavioral_checked", True) else "—",
+                "indigo", dark=True,
+            ),
             unsafe_allow_html=True,
         )
         c[2].markdown(
@@ -2873,6 +3205,7 @@ def main() -> None:
         elif page == "exam_portal":   show_exam_portal()
         elif page == "lab_portal":    show_lab_portal()
         elif page == "submitted":     show_submission_success()
+        elif page == "account":       show_student_account()
         else:                          show_student_courses()
 
 

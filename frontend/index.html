@@ -546,6 +546,8 @@
     timerHandle: null,
     checkHandle: null,
     initHandle: null,
+    focusHandle: null,
+    beatHandle: null,
     examState: null,
     labState: null,
     labProblemId: null,
@@ -678,6 +680,124 @@
     box.focus(); autoHeight();
   }
 
+  // ── Leaving the exam (other tab / other window / fullscreen exit) ─────────
+  // One poll loop inside this iframe and no listeners on the page around it,
+  // so nothing is left behind when the iframe goes away. A leave shorter than
+  // the grace period is forgiven. A longer one is reported once, and again
+  // 400 ms later in case another message overwrote the first; the server
+  // counts an episode only once. The server does the counting and the
+  // auto-submit, so a refresh or a tampered page cannot reset it.
+  function makeFocusWatch(cfg, io) {
+    const w = { awaySince: null, cause: null, episode: 0, reported: false,
+                fsEntered: false, fsUnsupported: false };
+    function causeNow() {
+      if (io.isHidden()) return "tab_hidden";
+      if (!io.pageHasFocus()) return "focus_lost";
+      if (cfg.requireFs && !w.fsUnsupported) {
+        if (io.inFullscreen()) w.fsEntered = true;
+        else if (w.fsEntered) return "fullscreen_exit";
+      }
+      return null;
+    }
+    function tick() {
+      const now = io.now();
+      const c = causeNow();
+      if (cfg.requireFs && !w.fsUnsupported) io.showFsGate(!io.inFullscreen());
+      if (c) {
+        if (w.awaySince === null) {
+          w.awaySince = now; w.cause = c; w.episode = now; w.reported = false;
+        } else if (!w.reported && now - w.awaySince >= cfg.graceMs) {
+          w.reported = true;
+          const msg = { kind: "exam_focus_event", cause: w.cause, episode: w.episode,
+                        away_ms: now - w.awaySince, answers: io.answers() };
+          io.send(Object.assign({ nonce: io.nonce() }, msg));
+          io.later(() => io.send(Object.assign({}, msg, { nonce: io.nonce() })), 400);
+        }
+      } else if (w.awaySince !== null) {
+        if (w.reported) {
+          io.send({ nonce: io.nonce(), kind: "exam_focus_return",
+                    episode: w.episode, away_ms: now - w.awaySince });
+          const n = cfg.leaves(), m = cfg.maxLeaves();
+          io.toast("⚠ You left the exam. This was recorded" +
+                   (n && m ? " (" + n + " of " + m + ")." : "."), true);
+        }
+        w.awaySince = null; w.cause = null; w.reported = false;
+      }
+    }
+    return { tick, w };
+  }
+
+  function stopFocusWatch() {
+    if (state.focusHandle) clearInterval(state.focusHandle);
+    if (state.beatHandle) clearInterval(state.beatHandle);
+    state.focusHandle = state.beatHandle = null;
+    const g = document.getElementById("fsGate");
+    if (g) g.remove();
+  }
+
+  function startFocusWatch(args, answersFn) {
+    stopFocusWatch();
+    if (!args.focus_watch) return;
+    // window.parent.document.hasFocus() is true while focus is anywhere in the page,
+    // including inside this iframe, so clicking the Submit button is not a "leave".
+    const par = () => { try { return window.parent.document; } catch (e) { return null; } };
+    const fsEl = () => { const d = par(); return d ? (d.fullscreenElement || d.webkitFullscreenElement) : null; };
+    const cfg = {
+      graceMs: args.grace_ms || 2000,
+      requireFs: !!args.require_fullscreen && !!par(),
+      leaves: () => (state.examState && state.examState.leaves) || 0,
+      maxLeaves: () => (state.examState && state.examState.maxLeaves) || 0,
+    };
+    let watch = null;
+
+    function showFsGate(show) {
+      let g = document.getElementById("fsGate");
+      if (!show) { if (g) g.style.display = "none"; return; }
+      if (!g) {
+        g = document.createElement("div");
+        g.id = "fsGate";
+        g.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:1000;" +
+          "background:rgba(15,23,42,0.97);color:#fff;display:flex;flex-direction:column;" +
+          "align-items:center;justify-content:flex-start;gap:14px;text-align:center;padding:80px 24px 24px;";
+        g.innerHTML = '<div style="font-size:18px;font-weight:700">This exam must be taken in fullscreen</div>' +
+          '<div style="opacity:.8;font-size:14px">Leaving fullscreen is recorded as leaving the exam.</div>' +
+          '<button id="fsBtn" style="padding:10px 22px;border-radius:10px;border:0;font-weight:700;' +
+          'background:#5b5ef4;color:#fff;cursor:pointer;font-size:14px">Enter fullscreen</button>';
+        document.body.appendChild(g);
+        document.getElementById("fsBtn").onclick = enterFs;
+      }
+      g.style.display = "flex";
+    }
+    function enterFs() {
+      const fail = () => {
+        watch.w.fsUnsupported = true; showFsGate(false);
+        showToast("Fullscreen isn't available on this device; continuing without it.", true);
+      };
+      try {
+        const el = par().documentElement;
+        const r = (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+        if (r && r.catch) r.catch(fail);
+      } catch (e) { fail(); }
+    }
+
+    const io = {
+      now: () => Date.now(),
+      nonce,
+      isHidden: () => document.hidden,
+      pageHasFocus: () => { const d = par(); return d ? d.hasFocus() : true; },
+      inFullscreen: () => !!fsEl(),
+      send: sendValue,
+      later: (fn, ms) => setTimeout(fn, ms),
+      toast: showToast,
+      answers: answersFn,
+      showFsGate,
+    };
+    watch = makeFocusWatch(cfg, io);
+    state.focusHandle = setInterval(watch.tick, 500);
+    state.beatHandle = setInterval(() => sendValue({ nonce: nonce(), kind: "exam_heartbeat" }), 30000);
+    watch.tick();
+  }
+
   // ── Exam-session widget ──────────────────────────────────────────────
   function renderExamSession(args) {
     state.type = "exam_session";
@@ -685,6 +805,8 @@
       questions: args.questions || [],
       duration: args.duration_ms,
       startedAt: args.started_at_ms,
+      leaves: args.leaves || 0,
+      maxLeaves: args.max_leaves || 0,
       buffer: [],
       checkIntervalMs: args.check_interval_ms || 30000,
       nextCheckAt: Date.now() + (args.check_interval_ms || 30000),
@@ -788,9 +910,14 @@
         t.textContent = "next check " + (r > 0 ? "in " + fmt(r) : "now");
       }
     }, 500);
+    startFocusWatch(args, gatherAnswers);
     autoHeight();
   }
   function updateExamSession(args) {
+    if (state.examState) {
+      state.examState.leaves = args.leaves || 0;
+      state.examState.maxLeaves = args.max_leaves || 0;
+    }
     const lastConf = args.last_confidence;
     const dotc = dotColor(lastConf);
     const dot = document.getElementById("examDot");
@@ -952,8 +1079,8 @@
           <b>Test ${i+1}</b> — ${r.status === "pass" ? "✅ pass" : "❌ fail"}
           (${r.awarded}/${r.points} pts)
           ${r.status === "fail" ? `<div style="color:#94a3b8;margin-top:0.25rem;">
-            <b>Got:</b> <code>${escapeHtml(r.got || "")}</code>
-            &nbsp;<b>Expected:</b> <code>${escapeHtml(r.expected || "")}</code>
+            ${escapeHtml(r.verdict || "Wrong answer")}
+            <span style="opacity:0.7;">&middot; hidden test, details are not shown</span>
           </div>` : ""}
         </div>`;
       }).join("");
