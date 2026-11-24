@@ -43,7 +43,7 @@ Faculty build exams, enroll students and review scores with typing-confidence hi
 | Typing features | 13 per sample |
 | Exam types | MCQ (auto-graded) and descriptive (stored for manual marking) |
 | Labs | C++17, hidden tests, per-test points |
-| Benchmark | 8 methods on the CMU keystroke dataset (51 typists) in [`experiments/`](experiments/) |
+| Benchmark | 8 methods on the CMU keystroke dataset (51 typists); see [Evidence](#evidence-benchmark-results) |
 
 **Project level.** A capstone-grade prototype: broad and working end to end, with a real benchmark behind the authentication idea. It is not production-ready because the anti-cheating rules run in the browser, student code is not sandboxed, and no automated tests are committed.
 
@@ -528,7 +528,7 @@ Only key columns are drawn. A twelfth table, `meta`, records the one-time import
 
 ## Evidence: benchmark results
 
-[`experiments/keystroke_verification.ipynb`](experiments/keystroke_verification.ipynb) tests 8 methods on the CMU keystroke dataset: 51 people, each typing the same password 400 times. Lower error is better. **EER** is the equal error rate; **FRR @ 1% FAR** is how often the real owner is rejected when impostors are held to 1%. See [`experiments/README.md`](experiments/README.md) for the protocol.
+An earlier notebook tested 8 methods on the CMU keystroke dataset: 51 people, each typing the same password 400 times. Lower error is better. **EER** is the equal error rate; **FRR @ 1% FAR** is how often the real owner is rejected when impostors are held to 1%. The notebook, its results files and the dataset were removed from the working tree, so the numbers below can no longer be reproduced from this repository. They remain in the Git history: `git show d78e32a:experiments/keystroke_verification.ipynb`.
 
 **Standard protocol** (train on the first 200 attempts, test on the last 200 plus 250 impostor attempts):
 
@@ -720,7 +720,6 @@ Candidates, in rough order of value:
 TrueTestAuth/
 ├── .devcontainer/devcontainer.json
 ├── .streamlit/config.toml
-├── experiments/                  CMU benchmark notebook, results, README
 ├── frontend/index.html           browser component
 ├── models/behavioral_auth_model_lstm/   profiles.json, lstm_model.keras, metadata.json
 ├── data/truetestauth.db          created on first run (git-ignored)
